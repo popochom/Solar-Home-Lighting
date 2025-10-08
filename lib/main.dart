@@ -1,51 +1,83 @@
+/*
+Solar Home Lighting App
+This is an app designed to control a smart home solar system. 
+It allows users to monitor the system, while also providing functions for
+switching lights and checking security cameras.
+*/
+
 import 'package:flutter/material.dart';
 
+/*
+App layout:
+  Login Page:
+    - email & password fields
+    - login button
+    - create account button
+
+  Main page:
+    - simplified view of power data (Battery Capacity, Current Wattage, etc.)
+    - buttons (or side menu?) to open other menus
+    - local weather data
+  
+  Power Data:
+    - display detailed power data
+    - Panel & Battery Temperature sensor data
+    - Error/Breaker Trip notifications
+
+  Light Controls:
+    - Customizable array of switch buttons
+    - Edit mode to add/remove/rename switches
+    - Status of each switch (on/off)
+
+  Camera Recordings:
+    - view recent recording (thumbnail & timestamp)
+    - download videos for watching on device.
+      - in app video player?
+
+  About:
+    - Problem Statement
+    - Brief description of app
+
+  Settings:
+    - Set location
+    - dark/light mode
+    - other user preferences
+
+Helper functions:
+  Firebase Access/Interaction:
+    - Get information
+    - Set information
+    - download video data
+
+  Power Info:
+    - graph generation data, battery capacity, loads, etc
+    -
+
+
+*/
+
 void main() {
-  runApp(const MyApp());
+  runApp(SolarHomeLighting());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
 
-  // This widget is the root of your application.
+//Main App
+class SolarHomeLighting extends StatelessWidget {
+  const SolarHomeLighting({super.key});
+
+  static const appTitle = 'Solar Home Lighting Monitor';
+
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
-      ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+    return const MaterialApp(
+      title: appTitle,
+      home: MyHomePage(title: appTitle),
     );
   }
 }
 
 class MyHomePage extends StatefulWidget {
   const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
 
   final String title;
 
@@ -54,69 +86,254 @@ class MyHomePage extends StatefulWidget {
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+  int _selectedIndex = 0;
 
-  void _incrementCounter() {
+  static const List<Widget> _widgetOptions = <Widget>[
+    LandingPage(),
+    PowerDataPage(),
+    LightControlsPage(),
+    CameraRecordingsPage(),
+    AboutPage(),
+    SettingsPage(),
+  ];
+
+  void _onItemTapped(int index) {
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      _selectedIndex = index;
     });
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
+        title: Text(
+          widget.title,
+          style: TextStyle(
+            //fontWeight: FontWeight.bold,
+            fontSize: 20,
+            color: Colors.white,
+          )
+        ),
+        centerTitle: true,
+        backgroundColor: Color.fromARGB(255, 128, 0, 0),
+        leading: Builder(
+          builder: (context) {
+            return IconButton(
+              icon: const Icon(Icons.menu),
+              onPressed: () {
+                Scaffold.of(context).openDrawer();
+              },
+            );
+          },
+        ),
       ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+      body: Center(child: _widgetOptions[_selectedIndex]),
+      drawer: Drawer(
+        // Add a ListView to the drawer. This ensures the user can scroll
+        // through the options in the drawer if there isn't enough vertical
+        // space to fit everything.
+        child: ListView(
+          // Important: Remove any padding from the ListView.
+          padding: EdgeInsets.zero,
+          children: [
+            const DrawerHeader(
+              decoration: BoxDecoration(color: Color.fromARGB(255, 128, 0, 0)),
+              child: Text(
+                'Solar \nHome \nLighting \nMonitor',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 20,
+                ),
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.home),
+              title: const Text('Home'),
+              selected: _selectedIndex == 0,
+              onTap: () {
+                // Update the state of the app
+                _onItemTapped(0);
+                // Then close the drawer
+                Navigator.pop(context);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.bolt),
+              title: const Text('Power Data'),
+              selected: _selectedIndex == 1,
+              onTap: () {
+                // Update the state of the app
+                _onItemTapped(1);
+                // Then close the drawer
+                Navigator.pop(context);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.lightbulb),
+              title: const Text('Light Controls'),
+              selected: _selectedIndex == 2,
+              onTap: () {
+                // Update the state of the app
+                _onItemTapped(2);
+                // Then close the drawer
+                Navigator.pop(context);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.videocam),
+              title: const Text('Recordings'),
+              selected: _selectedIndex == 3,
+              onTap: () {
+                // Update the state of the app
+                _onItemTapped(3);
+                // Then close the drawer
+                Navigator.pop(context);
+              },
+            ),
+            Divider(
+              height: 20,
+              thickness: 2,
+              indent: 20,
+              endIndent: 20,
+              color: Colors.grey,
+            ),
+            ListTile(
+              leading: const Icon(Icons.info),
+              title: const Text('About'),
+              onTap: () {
+                // Update the state of the app
+                _onItemTapped(4);
+                // Then close the drawer
+                Navigator.pop(context);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.settings),
+              title: const Text('Settings'),
+              onTap: () {
+                // Update the state of the app
+                _onItemTapped(5);
+                // Then close the drawer
+                Navigator.pop(context);
+              },
             ),
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
+    );
+  }
+}
+
+//Landing Page
+class LandingPage extends StatefulWidget {
+  const LandingPage({super.key});
+
+  @override
+  State<LandingPage> createState() => _LandingPageState();
+}
+
+class _LandingPageState extends State<LandingPage> {
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: Text('Landing Page'),
+      ),
+    );
+  }
+}
+
+
+//Power Data Page
+class PowerDataPage extends StatefulWidget {
+  const PowerDataPage({super.key});
+
+  @override
+  State<PowerDataPage> createState() => _PowerDataPageState();
+}
+
+class _PowerDataPageState extends State<PowerDataPage> {
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: Text('Power Data Page'),
+      ),
+    );
+  }
+}
+
+
+//Light Controls Page
+class LightControlsPage extends StatefulWidget {
+  const LightControlsPage({super.key});
+
+  @override
+  State<LightControlsPage> createState() => _LightControlsPageState();
+}
+
+class _LightControlsPageState extends State<LightControlsPage> {
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: Text('Light Controls Page'),
+      ),
+    );
+  }
+}
+
+
+//Camera Recordings Page
+class CameraRecordingsPage extends StatefulWidget {
+  const CameraRecordingsPage({super.key});
+
+  @override
+  State<CameraRecordingsPage> createState() => _CameraRecordingsPageState();
+}
+
+class _CameraRecordingsPageState extends State<CameraRecordingsPage> {
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: Text('Camera Recordings Page'),
+      ),
+    );
+  }
+}
+
+
+//About Page (stateless)
+class AboutPage extends StatelessWidget {
+  const AboutPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: Text('About Page'),
+      ),
+    );
+  }
+}
+
+//Settings Page
+class SettingsPage extends StatefulWidget {
+  const SettingsPage({super.key});
+
+  @override
+  State<SettingsPage> createState() => _SettingsPageState();
+}
+
+class _SettingsPageState extends State<SettingsPage> {
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Center(
+        child: Text('Settings Page'),
+      ),
     );
   }
 }
