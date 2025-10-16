@@ -6,6 +6,8 @@ switching lights and checking security cameras.
 */
 
 import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_database/firebase_database.dart';
 
 /*
 App layout:
@@ -56,7 +58,9 @@ Helper functions:
 
 */
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
   runApp(SolarHomeLighting());
 }
 
@@ -98,6 +102,8 @@ class _MyHomePageState extends State<MyHomePage> {
   ];
 
   void _onItemTapped(int index) {
+    DatabaseReference test = FirebaseDatabase.instance.ref().child("Test");
+    test.set("Hello World");
     setState(() {
       _selectedIndex = index;
     });
