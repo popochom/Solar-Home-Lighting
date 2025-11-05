@@ -8,6 +8,8 @@ switching lights and checking security cameras.
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_database/firebase_database.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'dart:async';
 
 /*
 App layout:
@@ -130,10 +132,163 @@ class _SolarHomeLightingState extends State<SolarHomeLighting> {
       theme: light,
       darkTheme: dark,
       themeMode: _themeMode,
-      home: MyHomePage(
-        title: SolarHomeLighting.appTitle,
-        themeMode: _themeMode,
-        onThemeChanged: _setDarkMode,
+      // Gate the app behind authentication; AuthGate will show LoginPage
+      // when not signed in and MyHomePage when signed in.
+      home: AuthGate(themeMode: _themeMode, onThemeChanged: _setDarkMode),
+    );
+  }
+}
+
+// Authentication gate: shows LoginPage when not signed-in, otherwise the main app
+class AuthGate extends StatelessWidget {
+  final ThemeMode themeMode;
+  final void Function(bool) onThemeChanged;
+
+  const AuthGate({super.key, required this.themeMode, required this.onThemeChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<User?>(
+      stream: FirebaseAuth.instance.authStateChanges(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
+
+        if (snapshot.hasData && snapshot.data != null) {
+          // Signed in
+          return MyHomePage(title: SolarHomeLighting.appTitle, themeMode: themeMode, onThemeChanged: onThemeChanged);
+        }
+
+        return const LoginPage();
+      },
+    );
+  }
+}
+
+// Simple Login page using Firebase Auth (email/password)
+class LoginPage extends StatefulWidget {
+  const LoginPage({super.key});
+
+  @override
+  State<LoginPage> createState() => _LoginPageState();
+}
+
+class _LoginPageState extends State<LoginPage> {
+  final TextEditingController _emailController = TextEditingController();
+  final TextEditingController _passwordController = TextEditingController();
+  bool _loading = false;
+
+  Future<void> _showMessage(String msg) async {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+  }
+
+  Future<void> _signIn() async {
+    setState(() => _loading = true);
+    try {
+      await FirebaseAuth.instance.signInWithEmailAndPassword(
+        email: _emailController.text.trim(),
+        password: _passwordController.text,
+      );
+      // on success, AuthGate's stream will update and show the main app
+    } on FirebaseAuthException catch (e) {
+      await _showMessage(e.message ?? 'Sign-in failed');
+    } catch (_) {
+      await _showMessage('Sign-in failed');
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _register() async {
+    setState(() => _loading = true);
+    try {
+      await FirebaseAuth.instance.createUserWithEmailAndPassword(
+        email: _emailController.text.trim(),
+        password: _passwordController.text,
+      );
+      await _showMessage('Account created — signed in');
+    } on FirebaseAuthException catch (e) {
+      await _showMessage(e.message ?? 'Account creation failed');
+    } catch (_) {
+      await _showMessage('Account creation failed');
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _resetPassword() async {
+    final email = _emailController.text.trim();
+    if (email.isEmpty) {
+      await _showMessage('Enter your email to reset password');
+      return;
+    }
+
+    setState(() => _loading = true);
+    try {
+      await FirebaseAuth.instance.sendPasswordResetEmail(email: email);
+      await _showMessage('Password reset email sent');
+    } on FirebaseAuthException catch (e) {
+      await _showMessage(e.message ?? 'Failed to send reset email');
+    } catch (_) {
+      await _showMessage('Failed to send reset email');
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    _emailController.dispose();
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Sign in')),
+      body: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24.0),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 480),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text('Welcome', style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _emailController,
+                  decoration: const InputDecoration(labelText: 'Email'),
+                  keyboardType: TextInputType.emailAddress,
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _passwordController,
+                  decoration: const InputDecoration(labelText: 'Password'),
+                  obscureText: true,
+                ),
+                const SizedBox(height: 20),
+                ElevatedButton(
+                  onPressed: _loading ? null : _signIn,
+                  child: _loading ? const SizedBox(height: 20, width: 20, child: CircularProgressIndicator(strokeWidth: 2)) : const Text('Log in'),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton(
+                  onPressed: _loading ? null : _register,
+                  child: const Text('Create account'),
+                ),
+                const SizedBox(height: 8),
+                TextButton(
+                  onPressed: _loading ? null : _resetPassword,
+                  child: const Text('Forgot password?'),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -152,12 +307,12 @@ class MyHomePage extends StatefulWidget {
 
 class _MyHomePageState extends State<MyHomePage> {
   int _selectedIndex = 0;
-  final database = FirebaseDatabase.instance.ref();
+  final database = userRef();
 
   Widget _buildPage(int index) {
     switch (index) {
       case 0:
-        return const LandingPage();
+        return LandingPage();
       case 1:
         return const PowerDataPage();
       case 2:
@@ -206,13 +361,9 @@ class _MyHomePageState extends State<MyHomePage> {
       ),
   body: Center(child: _buildPage(_selectedIndex)),
       drawer: Drawer(
-        // Add a ListView to the drawer. This ensures the user can scroll
-        // through the options in the drawer if there isn't enough vertical
-        // space to fit everything.
-        child: ListView(
-          // Important: Remove any padding from the ListView.
-          padding: EdgeInsets.zero,
+        child: Column(
           children: [
+            // Header + scrollable list
             const DrawerHeader(
               decoration: BoxDecoration(color: Color.fromARGB(255, 128, 0, 0)),
               child: Text(
@@ -223,76 +374,94 @@ class _MyHomePageState extends State<MyHomePage> {
                 ),
               ),
             ),
-            ListTile(
-              leading: const Icon(Icons.home),
-              title: const Text('Home'),
-              selected: _selectedIndex == 0,
-              onTap: () {
-                // Update the state of the app
-                _onItemTapped(0);
-                // Then close the drawer
-                Navigator.pop(context);
-              },
+            Expanded(
+              child: ListView(
+                padding: EdgeInsets.zero,
+                children: [
+                  ListTile(
+                    leading: const Icon(Icons.home),
+                    title: const Text('Home'),
+                    selected: _selectedIndex == 0,
+                    onTap: () {
+                      _onItemTapped(0);
+                      Navigator.pop(context);
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.bolt),
+                    title: const Text('Power Data'),
+                    selected: _selectedIndex == 1,
+                    onTap: () {
+                      _onItemTapped(1);
+                      Navigator.pop(context);
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.lightbulb),
+                    title: const Text('Light Controls'),
+                    selected: _selectedIndex == 2,
+                    onTap: () {
+                      _onItemTapped(2);
+                      Navigator.pop(context);
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.videocam),
+                    title: const Text('Recordings'),
+                    selected: _selectedIndex == 3,
+                    onTap: () {
+                      _onItemTapped(3);
+                      Navigator.pop(context);
+                    },
+                  ),
+                  const Divider(
+                    height: 20,
+                    thickness: 2,
+                    indent: 20,
+                    endIndent: 20,
+                    color: Colors.grey,
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.info),
+                    title: const Text('About'),
+                    onTap: () {
+                      _onItemTapped(4);
+                      Navigator.pop(context);
+                    },
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.settings),
+                    title: const Text('Settings'),
+                    onTap: () {
+                      _onItemTapped(5);
+                      Navigator.pop(context);
+                    },
+                  ),
+                ],
+              ),
             ),
-            ListTile(
-              leading: const Icon(Icons.bolt),
-              title: const Text('Power Data'),
-              selected: _selectedIndex == 1,
-              onTap: () {
-                // Update the state of the app
-                _onItemTapped(1);
-                // Then close the drawer
-                Navigator.pop(context);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.lightbulb),
-              title: const Text('Light Controls'),
-              selected: _selectedIndex == 2,
-              onTap: () {
-                // Update the state of the app
-                _onItemTapped(2);
-                // Then close the drawer
-                Navigator.pop(context);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.videocam),
-              title: const Text('Recordings'),
-              selected: _selectedIndex == 3,
-              onTap: () {
-                // Update the state of the app
-                _onItemTapped(3);
-                // Then close the drawer
-                Navigator.pop(context);
-              },
-            ),
-            Divider(
-              height: 20,
-              thickness: 2,
-              indent: 20,
-              endIndent: 20,
-              color: Colors.grey,
-            ),
-            ListTile(
-              leading: const Icon(Icons.info),
-              title: const Text('About'),
-              onTap: () {
-                // Update the state of the app
-                _onItemTapped(4);
-                // Then close the drawer
-                Navigator.pop(context);
-              },
-            ),
-            ListTile(
-              leading: const Icon(Icons.settings),
-              title: const Text('Settings'),
-              onTap: () {
-                // Update the state of the app
-                _onItemTapped(5);
-                // Then close the drawer
-                Navigator.pop(context);
-              },
+
+            // Bottom sign-out button
+            SafeArea(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Divider(),
+                  ListTile(
+                    leading: const Icon(Icons.logout),
+                    title: const Text('Sign out'),
+                    onTap: () async {
+                      try {
+                        await FirebaseAuth.instance.signOut();
+                      } catch (e) {
+                        // ignore sign-out errors — auth state will update if successful
+                      }
+                      // Close the drawer
+                      if (context.mounted) Navigator.pop(context);
+                    },
+                  ),
+                ],
+              ),
             ),
           ],
         ),
@@ -310,13 +479,236 @@ class LandingPage extends StatefulWidget {
 }
 
 class _LandingPageState extends State<LandingPage> {
+  // Firebase-backed power values
+  double _generation = 0.0;
+  double _battery = 0.0;
+  double _usage = 0.0;
+  // Configurable maxima (from settings)
+  double _panelMax = 1000.0;
+  double _batteryMax = 100.0;
+
+  StreamSubscription<DatabaseEvent>? _genSub;
+  StreamSubscription<DatabaseEvent>? _batSub;
+  StreamSubscription<DatabaseEvent>? _useSub;
+  StreamSubscription<DatabaseEvent>? _panelMaxSub;
+  StreamSubscription<DatabaseEvent>? _batteryMaxSub;
+
+  @override
+  void initState() {
+    super.initState();
+    _startPowerListeners();
+  }
+
+  void _startPowerListeners() {
+    final db = userRef();
+
+    _genSub = db.child('powerData').child('generation').onValue.listen((event) {
+      final v = _parseFirebaseNumeric(event.snapshot.value);
+      if (mounted) setState(() => _generation = v);
+    }, onError: (_) {});
+
+    _batSub = db.child('powerData').child('battery').onValue.listen((event) {
+      final v = _parseFirebaseNumeric(event.snapshot.value);
+      if (mounted) setState(() => _battery = v);
+    }, onError: (_) {});
+
+    _useSub = db.child('powerData').child('usage').onValue.listen((event) {
+      final v = _parseFirebaseNumeric(event.snapshot.value);
+      if (mounted) setState(() => _usage = v);
+    }, onError: (_) {});
+
+    // listen for configurable maxima in settings
+    _panelMaxSub = db.child('settings').child('panelSpecW').onValue.listen((event) {
+      final v = _parseFirebaseNumeric(event.snapshot.value);
+      if (v > 0 && mounted) setState(() => _panelMax = v);
+    }, onError: (_) {});
+
+    _batteryMaxSub = db.child('settings').child('batteryCapacityMax').onValue.listen((event) {
+      final v = _parseFirebaseNumeric(event.snapshot.value);
+      if (v > 0 && mounted) setState(() => _batteryMax = v);
+    }, onError: (_) {});
+  }
+
+  Future<void> _manualRefresh() async {
+    try {
+  final db = userRef();
+  final genSnap = await db.child('powerData').child('generation').get();
+  final batSnap = await db.child('powerData').child('battery').get();
+  final useSnap = await db.child('powerData').child('usage').get();
+
+      final gen = _parseFirebaseNumeric(genSnap.value);
+      final bat = _parseFirebaseNumeric(batSnap.value);
+      final use = _parseFirebaseNumeric(useSnap.value);
+
+      if (mounted) {
+        setState(() {
+          _generation = gen;
+          _battery = bat;
+          _usage = use;
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Failed to refresh data from Firebase')));
+      }
+    }
+  }
+
+  double _parseFirebaseNumeric(dynamic v) {
+    if (v == null) return 0.0;
+    if (v is num) return v.toDouble();
+    if (v is String) return double.tryParse(v) ?? 0.0;
+    return 0.0;
+  }
+
+  @override
+  void dispose() {
+    _genSub?.cancel();
+    _batSub?.cancel();
+    _useSub?.cancel();
+    _panelMaxSub?.cancel();
+    _batteryMaxSub?.cancel();
+    super.dispose();
+  }
   @override
   Widget build(BuildContext context) {
+    final colorScheme = Theme.of(context).colorScheme;
+    Widget infoCard({required Widget child, required String title}) {
+      return Card(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        elevation: 4,
+        child: Padding(
+          padding: const EdgeInsets.all(12.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title, style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: colorScheme.onSurface)),
+              const SizedBox(height: 8),
+              // Use Flexible with a loose fit so the child may size itself
+              // without forcing overflow in tight cards (fixes small bottom
+              // overflow in the Weather card).
+              Flexible(fit: FlexFit.loose, child: child),
+            ],
+          ),
+        ),
+      );
+    }
+
     return Scaffold(
-      body: Center(
-        child: Text('Landing Page'),
+      body: Padding(
+        padding: const EdgeInsets.all(12.0),
+        child: Stack(
+          children: [
+            // Grid of cards that also responds to taps to trigger a manual refresh
+            Positioned.fill(
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: _manualRefresh,
+                child: GridView.count(
+                  crossAxisCount: 2,
+                  crossAxisSpacing: 12,
+                  mainAxisSpacing: 12,
+                  children: [
+                    // Current Generation (watts)
+                    infoCard(
+                      title: 'Current Generation (W)',
+                      child: SpeedometerPlaceholder(value: _generation, max: _panelMax, unit: 'W'),
+                    ),
+
+                    // Battery Capacity (percent)
+                    infoCard(
+                      title: 'Battery Capacity (Ah)',
+                      // Firebase provides battery as a percentage; convert to Ah
+                      child: SpeedometerPlaceholder(value: (_battery / 100.0) * _batteryMax, max: _batteryMax, unit: 'Ah'),
+                    ),
+
+                    // Power Usage (watts)
+                    infoCard(
+                      title: 'Power Usage (W)',
+                      child: SpeedometerPlaceholder(value: _usage, max: _panelMax, unit: 'W'),
+                    ),
+
+                    // Weather
+                    infoCard(
+                      title: 'Weather',
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        crossAxisAlignment: CrossAxisAlignment.center,
+                        children: [
+                          // Use an icon as placeholder for storm clouds
+                          Icon(Icons.cloud, size: 48, color: colorScheme.primary),
+                          const SizedBox(height: 8),
+                          Text('79°', style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: colorScheme.onSurface)),
+                          const SizedBox(height: 4),
+                          Text('Partly Cloudy', style: TextStyle(fontSize: 14, color: colorScheme.onSurface)),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+            // small refresh button in the bottom-right of the landing area
+            Positioned(
+              bottom: 8,
+              right: 8,
+              child: Material(
+                color: Colors.transparent,
+                child: IconButton(
+                  tooltip: 'Refresh',
+                  icon: const Icon(Icons.refresh),
+                  onPressed: _manualRefresh,
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
+  }
+}
+
+// Simple circular "speedometer" placeholder widget
+class SpeedometerPlaceholder extends StatelessWidget {
+  final double value;
+  final double max;
+  final String unit;
+
+  const SpeedometerPlaceholder({super.key, required this.value, required this.max, required this.unit});
+
+  @override
+  Widget build(BuildContext context) {
+    final pct = (value / max).clamp(0.0, 1.0);
+    final primary = Theme.of(context).colorScheme.primary;
+    final onSurface = Theme.of(context).colorScheme.onSurface;
+    return LayoutBuilder(builder: (context, constraints) {
+      final size = constraints.biggest.shortestSide;
+      return Center(
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            SizedBox(
+              width: size,
+              height: size,
+              child: CircularProgressIndicator(
+                value: pct,
+                strokeWidth: 12,
+                color: primary,
+              ),
+            ),
+            Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(value.toStringAsFixed(value < 10 ? 1 : 0), style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: onSurface)),
+                const SizedBox(height: 4),
+                Text(unit, style: TextStyle(fontSize: 12)),
+              ],
+            ),
+          ],
+        ),
+      );
+    });
   }
 }
 
@@ -357,7 +749,7 @@ class LightingControl {
 }
 
 class _LightControlsPageState extends State<LightControlsPage> {
-  final lightingControlsRef = FirebaseDatabase.instance.ref().child("lightingControls");
+  final lightingControlsRef = userRef().child("lightingControls");
 
   // Example initial controls; you can replace or load these from Firebase.
   final List<LightingControl> controls = [
@@ -514,12 +906,19 @@ class _LightControlsPageState extends State<LightControlsPage> {
                 onPressed: () => setState(() => _isEditing = !_isEditing),
                 icon: Icon(_isEditing ? Icons.check : Icons.edit),
                 label: Text(_isEditing ? 'Done' : 'Edit Controls'),
+                style: ElevatedButton.styleFrom(
+                  // Ensure label and icon are white regardless of theme
+                  foregroundColor: Colors.white,
+                ),
               ),
               const SizedBox(width: 12),
               ElevatedButton.icon(
                 onPressed: _addControl,
                 icon: const Icon(Icons.add),
                 label: const Text('Add Control'),
+                style: ElevatedButton.styleFrom(
+                  foregroundColor: Colors.white,
+                ),
               ),
             ],
           ),
@@ -611,16 +1010,52 @@ class SettingsPage extends StatefulWidget {
 
 class _SettingsPageState extends State<SettingsPage> {
   int _nightPref = 0;
+  late TextEditingController _panelController;
+  late TextEditingController _batteryController;
 
   @override
   void initState() {
     super.initState();
     _loadNightPref();
+    _panelController = TextEditingController();
+    _batteryController = TextEditingController();
+    _loadSpecs();
+  }
+  @override
+  void dispose() {
+    _panelController.dispose();
+    _batteryController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadSpecs() async {
+    try {
+      final db = userRef().child('settings');
+      final panelSnap = await db.child('panelSpecW').get();
+      if (panelSnap.exists) {
+        final v = panelSnap.value;
+        if (v != null) {
+          final parsed = v is num ? v.toDouble() : double.tryParse(v.toString());
+          if (parsed != null) _panelController.text = parsed.toString();
+        }
+      }
+
+  final batSnap = await db.child('batteryCapacityMax').get();
+      if (batSnap.exists) {
+        final v = batSnap.value;
+        if (v != null) {
+          final parsed = v is num ? v.toDouble() : double.tryParse(v.toString());
+          if (parsed != null) _batteryController.text = parsed.toString();
+        }
+      }
+    } catch (e) {
+      // ignore load errors
+    }
   }
 
   Future<void> _loadNightPref() async {
     try {
-      final snap = await FirebaseDatabase.instance.ref().child('settings/nightLightPref').get();
+      final snap = await userRef().child('settings').child('nightLightPref').get();
       if (snap.exists) {
         final val = snap.value;
         if (val is int) {
@@ -636,20 +1071,91 @@ class _SettingsPageState extends State<SettingsPage> {
   }
   @override
   Widget build(BuildContext context) {
-    final isDark = widget.themeMode == ThemeMode.dark;
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),
       body: ListView(
         padding: const EdgeInsets.all(16.0),
         children: [
+          // Dark mode tile moved to bottom of settings for easier access after other preferences.
+          // Additional settings can be added here
+          const SizedBox(height: 16),
+          const SizedBox(height: 8),
+          const Text('Solar Panel Specifications', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _panelController,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(
+              labelText: 'Panel spec (W)',
+              hintText: 'e.g. 1000.0',
+            ),
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _batteryController,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            decoration: const InputDecoration(
+              labelText: 'Battery capacity (Ah)',
+              hintText: 'e.g. 200.0',
+            ),
+          ),
+          const SizedBox(height: 8),
+          ElevatedButton(
+            onPressed: () async {
+              final panelText = _panelController.text.trim();
+              final batText = _batteryController.text.trim();
+              final panelVal = double.tryParse(panelText);
+              final batVal = double.tryParse(batText);
+              if (panelVal == null || panelVal <= 0) {
+                if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Invalid panel spec')));
+                return;
+              }
+              if (batVal == null || batVal <= 0) {
+                if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Invalid battery capacity')));
+                return;
+              }
+
+              try {
+                final settingsRef = userRef().child('settings');
+                await settingsRef.child('panelSpecW').set(panelVal);
+                await settingsRef.child('batteryCapacityMax').set(batVal);
+                if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Specifications saved')));
+              } catch (e) {
+                if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Failed to save specifications')));
+              }
+            },
+            child: const Text('Save Specifications'),
+          ),
+          const Text('Night lighting mode', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
+            const SizedBox(height: 8),
+            DropdownButton<int>(
+              value: _nightPref,
+              items: const [
+                DropdownMenuItem(value: 0, child: Text('Off')),
+                DropdownMenuItem(value: 1, child: Text('Motion')),
+                DropdownMenuItem(value: 2, child: Text('Human Activity')),
+              ],
+              onChanged: (v) async {
+                if (v == null) return;
+                try {
+                    await userRef().child('settings').child('nightLightPref').set(v);
+                  setState(() => _nightPref = v);
+                } catch (e) {
+                  if(context.mounted){
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Failed to save night lighting preference')));
+                  }
+                }
+              },
+            ),
+          const SizedBox(height: 16),
           SwitchListTile(
             title: const Text('Dark mode'),
             subtitle: const Text('Toggle between light and dark themes'),
-            value: isDark,
+            value: widget.themeMode == ThemeMode.dark,
             onChanged: (value) async {
               // Update remote setting in Firebase
               try {
-                final settingsRef = FirebaseDatabase.instance.ref().child('settings');
+                final settingsRef = userRef().child('settings');
                 await settingsRef.child('darkMode').set(value);
               } catch (e) {
                 if(context.mounted){
@@ -665,31 +1171,14 @@ class _SettingsPageState extends State<SettingsPage> {
             },
             secondary: const Icon(Icons.brightness_6),
           ),
-          // Additional settings can be added here
-          const SizedBox(height: 16),
-          const Text('Night lighting mode', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
-            const SizedBox(height: 8),
-            DropdownButton<int>(
-              value: _nightPref,
-              items: const [
-                DropdownMenuItem(value: 0, child: Text('Off')),
-                DropdownMenuItem(value: 1, child: Text('Motion')),
-                DropdownMenuItem(value: 2, child: Text('Human Activity')),
-              ],
-              onChanged: (v) async {
-                if (v == null) return;
-                try {
-                  await FirebaseDatabase.instance.ref().child('settings').child('nightLightPref').set(v);
-                  setState(() => _nightPref = v);
-                } catch (e) {
-                  if(context.mounted){
-                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Failed to save night lighting preference')));
-                  }
-                }
-              },
-            ),
         ],
       ),
     );
   }
+}
+
+// Helper to scope all database access under solar_data/users/<uid>
+DatabaseReference userRef() {
+  final uid = FirebaseAuth.instance.currentUser?.uid ?? 'unknown';
+  return FirebaseDatabase.instance.ref().child('solar_data').child('users').child(uid);
 }
