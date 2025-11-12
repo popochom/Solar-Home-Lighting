@@ -5,11 +5,17 @@ It allows users to monitor the system, while also providing functions for
 switching lights and checking security cameras.
 */
 
-import 'package:flutter/material.dart';
-import 'package:firebase_core/firebase_core.dart';
-import 'package:firebase_database/firebase_database.dart';
-import 'package:firebase_auth/firebase_auth.dart';
-import 'dart:async';
+import "package:flutter/material.dart";
+import "package:firebase_core/firebase_core.dart";
+import "package:firebase_database/firebase_database.dart";
+import "package:firebase_auth/firebase_auth.dart";
+import "dart:async";
+import 'package:fl_chart/fl_chart.dart';
+import 'dart:math' as math;
+import 'package:firebase_storage/firebase_storage.dart';
+import 'dart:io';
+import 'package:path_provider/path_provider.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 /*
 App layout:
@@ -71,7 +77,7 @@ Future<void> main() async {
 class SolarHomeLighting extends StatefulWidget {
   const SolarHomeLighting({super.key});
 
-  static const appTitle = 'Solar Home Lighting Monitor';
+  static const appTitle = "Solar Home Lighting Monitor";
 
   @override
   State<SolarHomeLighting> createState() => _SolarHomeLightingState();
@@ -204,10 +210,28 @@ class _LoginPageState extends State<LoginPage> {
   Future<void> _register() async {
     setState(() => _loading = true);
     try {
-      await FirebaseAuth.instance.createUserWithEmailAndPassword(
+      final cred = await FirebaseAuth.instance.createUserWithEmailAndPassword(
         email: _emailController.text.trim(),
         password: _passwordController.text,
       );
+
+      // On successful account creation, import the default data template
+      // into the new user's subtree: solar_data/users/<uid>
+      final user = cred.user;
+      if (user != null) {
+        try {
+          final uid = user.uid;
+          final ref = FirebaseDatabase.instance.ref().child('solar_data').child('users').child(uid);
+          await ref.set(_dataTemplate);
+        } catch (e) {
+          // If writing the template fails, still consider the account created,
+          // but inform the user.
+          await _showMessage('Account created but failed to initialize user data');
+          if (mounted) setState(() => _loading = false);
+          return;
+        }
+      }
+
       await _showMessage('Account created — signed in');
     } on FirebaseAuthException catch (e) {
       await _showMessage(e.message ?? 'Account creation failed');
@@ -308,13 +332,21 @@ class MyHomePage extends StatefulWidget {
 class _MyHomePageState extends State<MyHomePage> {
   int _selectedIndex = 0;
   final database = userRef();
+  int? _requestedMetricIndex;
+  int? _requestedIntervalIndex;
 
   Widget _buildPage(int index) {
     switch (index) {
       case 0:
-        return LandingPage();
+        return LandingPage(onNavigateToPage: (page, {int? metricIndex, int? intervalIndex}) {
+          setState(() {
+            _selectedIndex = page;
+            _requestedMetricIndex = metricIndex;
+            _requestedIntervalIndex = intervalIndex;
+          });
+        });
       case 1:
-        return const PowerDataPage();
+        return PowerDataPage(initialMetricIndex: _requestedMetricIndex, initialIntervalIndex: _requestedIntervalIndex);
       case 2:
         return const LightControlsPage();
       case 3:
@@ -472,7 +504,9 @@ class _MyHomePageState extends State<MyHomePage> {
 
 //Landing Page
 class LandingPage extends StatefulWidget {
-  const LandingPage({super.key});
+  final void Function(int page, {int? metricIndex, int? intervalIndex})? onNavigateToPage;
+
+  const LandingPage({super.key, this.onNavigateToPage});
 
   @override
   State<LandingPage> createState() => _LandingPageState();
@@ -483,6 +517,7 @@ class _LandingPageState extends State<LandingPage> {
   double _generation = 0.0;
   double _battery = 0.0;
   double _usage = 0.0;
+  double _batteryTemp = 0.0;
   // Configurable maxima (from settings)
   double _panelMax = 1000.0;
   double _batteryMax = 100.0;
@@ -490,6 +525,7 @@ class _LandingPageState extends State<LandingPage> {
   StreamSubscription<DatabaseEvent>? _genSub;
   StreamSubscription<DatabaseEvent>? _batSub;
   StreamSubscription<DatabaseEvent>? _useSub;
+  StreamSubscription<DatabaseEvent>? _sensorSub;
   StreamSubscription<DatabaseEvent>? _panelMaxSub;
   StreamSubscription<DatabaseEvent>? _batteryMaxSub;
 
@@ -526,6 +562,22 @@ class _LandingPageState extends State<LandingPage> {
     _batteryMaxSub = db.child('settings').child('batteryCapacityMax').onValue.listen((event) {
       final v = _parseFirebaseNumeric(event.snapshot.value);
       if (v > 0 && mounted) setState(() => _batteryMax = v);
+    }, onError: (_) {});
+
+    // sensorData (battery temperature)
+    _sensorSub = db.child('sensorData').onValue.listen((event) {
+      try {
+        final snap = event.snapshot.value;
+        if (snap is Map && snap.containsKey('battery_temp')) {
+          final v = snap['battery_temp'];
+          final parsed = _parseFirebaseNumeric(v);
+          if (mounted) setState(() => _batteryTemp = parsed);
+        } else if (snap is Map && snap.containsKey('battery_Temp')) {
+          final v = snap['battery_Temp'];
+          final parsed = _parseFirebaseNumeric(v);
+          if (mounted) setState(() => _batteryTemp = parsed);
+        }
+      } catch (_) {}
     }, onError: (_) {});
   }
 
@@ -568,6 +620,7 @@ class _LandingPageState extends State<LandingPage> {
     _useSub?.cancel();
     _panelMaxSub?.cancel();
     _batteryMaxSub?.cancel();
+    _sensorSub?.cancel();
     super.dispose();
   }
   @override
@@ -610,38 +663,41 @@ class _LandingPageState extends State<LandingPage> {
                   mainAxisSpacing: 12,
                   children: [
                     // Current Generation (watts)
-                    infoCard(
-                      title: 'Current Generation (W)',
-                      child: SpeedometerPlaceholder(value: _generation, max: _panelMax, unit: 'W'),
+                    GestureDetector(
+                      onTap: () => widget.onNavigateToPage?.call(1, metricIndex: 0),
+                      child: infoCard(
+                        title: 'Current Generation (W)',
+                        child: SpeedometerPlaceholder(value: _generation, max: _panelMax, unit: 'W'),
+                      ),
                     ),
 
                     // Battery Capacity (percent)
-                    infoCard(
-                      title: 'Battery Capacity (Ah)',
-                      // Firebase provides battery as a percentage; convert to Ah
-                      child: SpeedometerPlaceholder(value: (_battery / 100.0) * _batteryMax, max: _batteryMax, unit: 'Ah'),
+                    GestureDetector(
+                      onTap: () => widget.onNavigateToPage?.call(1, metricIndex: 1),
+                      child: infoCard(
+                        title: 'Battery Capacity (Ah)',
+                        // Firebase provides battery as a percentage; convert to Ah
+                        child: SpeedometerPlaceholder(value: (_battery / 100.0) * _batteryMax, max: _batteryMax, unit: 'Ah'),
+                      ),
                     ),
 
                     // Power Usage (watts)
-                    infoCard(
-                      title: 'Power Usage (W)',
-                      child: SpeedometerPlaceholder(value: _usage, max: _panelMax, unit: 'W'),
+                    GestureDetector(
+                      onTap: () => widget.onNavigateToPage?.call(1, metricIndex: 0),
+                      child: infoCard(
+                        title: 'Power Usage (W)',
+                        child: SpeedometerPlaceholder(value: _usage, max: _panelMax, unit: 'W'),
+                      ),
                     ),
 
-                    // Weather
-                    infoCard(
-                      title: 'Weather',
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        crossAxisAlignment: CrossAxisAlignment.center,
-                        children: [
-                          // Use an icon as placeholder for storm clouds
-                          Icon(Icons.cloud, size: 48, color: colorScheme.primary),
-                          const SizedBox(height: 8),
-                          Text('79°', style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: colorScheme.onSurface)),
-                          const SizedBox(height: 4),
-                          Text('Partly Cloudy', style: TextStyle(fontSize: 14, color: colorScheme.onSurface)),
-                        ],
+                    // Battery Temperature (°C)
+                    GestureDetector(
+                      onTap: () => widget.onNavigateToPage?.call(1, metricIndex: 3),
+                      child: infoCard(
+                        title: 'Battery Temperature (°C)',
+                        child: Center(
+                          child: SpeedometerPlaceholder(value: _batteryTemp, max: 100, unit: '°C'),
+                        ),
                       ),
                     ),
                   ],
@@ -669,7 +725,7 @@ class _LandingPageState extends State<LandingPage> {
   }
 }
 
-// Simple circular "speedometer" placeholder widget
+// Simple circular "speedometer" widget
 class SpeedometerPlaceholder extends StatelessWidget {
   final double value;
   final double max;
@@ -715,18 +771,246 @@ class SpeedometerPlaceholder extends StatelessWidget {
 
 //Power Data Page
 class PowerDataPage extends StatefulWidget {
-  const PowerDataPage({super.key});
+  final int? initialMetricIndex;
+  final int? initialIntervalIndex;
+
+  const PowerDataPage({super.key, this.initialMetricIndex, this.initialIntervalIndex});
 
   @override
   State<PowerDataPage> createState() => _PowerDataPageState();
 }
 
 class _PowerDataPageState extends State<PowerDataPage> {
+  StreamSubscription<DatabaseEvent>? _readingsSub;
+  Map<String, dynamic> _readings = {};
+
+  // Metrics the user can choose from
+  final List<Map<String, String>> _metrics = [
+    {"label": "Power (W)", "key": "power", "unit": "W"},
+    {"label": "Current (A)", "key": "current", "unit": "A"},
+    {"label": "Voltage (V)", "key": "voltage", "unit": "V"},
+    {"label": "Temperature (°C)", "key": "temperature", "unit": "°C"},
+  ];
+  int _metricIndex = 0;
+
+  // Time interval options
+  final List<Map<String, dynamic>> _intervals = [
+    {"label": "30 mins", "dur": Duration(minutes: 30)},
+    {"label": "1 hour", "dur": Duration(hours: 1)},
+    {"label": "6 hours", "dur": Duration(hours: 6)},
+    {"label": "24 hours", "dur": Duration(hours: 24)},
+  ];
+  int _intervalIndex = 2; // default 6 hours
+
+  @override
+  void initState() {
+    super.initState();
+    // initialize metric/interval from widget if provided
+    if (widget.initialMetricIndex != null) _metricIndex = widget.initialMetricIndex!;
+    if (widget.initialIntervalIndex != null) _intervalIndex = widget.initialIntervalIndex!;
+    _subscribe();
+  }
+
+  void _subscribe() {
+    _readingsSub?.cancel();
+    _readingsSub = userRef().child('readings').onValue.listen((event) {
+      final v = event.snapshot.value;
+      if (v is Map) {
+        setState(() => _readings = Map<String, dynamic>.from(v));
+      } else {
+        setState(() => _readings = {});
+      }
+    }, onError: (_) {
+      setState(() => _readings = {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _readingsSub?.cancel();
+    super.dispose();
+  }
+
+  // Build the key used by the DB: MMDDYYYYhhmm (UTC)
+  String _keyForUtc(DateTime dt) {
+    final t = dt.toUtc();
+    final mm = t.month.toString().padLeft(2, '0');
+    final dd = t.day.toString().padLeft(2, '0');
+    final yyyy = t.year.toString();
+    final hh = t.hour.toString().padLeft(2, '0');
+    final mi = t.minute.toString().padLeft(2, '0');
+    return '$mm$dd$yyyy$hh$mi';
+  }
+
+  double _extract(dynamic entry, String key) {
+    if (entry == null) return 0.0;
+    if (entry is num) return entry.toDouble();
+    if (entry is String) return double.tryParse(entry) ?? 0.0;
+    if (entry is Map) {
+      final v = entry[key];
+      if (v is num) return v.toDouble();
+      if (v is String) return double.tryParse(v) ?? 0.0;
+    }
+    return 0.0;
+  }
+
   @override
   Widget build(BuildContext context) {
+    final metricKey = _metrics[_metricIndex]['key']!;
+    final unit = _metrics[_metricIndex]['unit']!;
+    final dur = _intervals[_intervalIndex]['dur'] as Duration;
+
+    final end = DateTime.now().toUtc();
+    final start = end.subtract(dur);
+    final step = Duration(minutes: 5);
+
+    // Floor start to nearest 5 minutes
+    DateTime t = DateTime.utc(start.year, start.month, start.day, start.hour, (start.minute ~/ 5) * 5);
+    if (t.isBefore(start)) t = t.add(step);
+
+    final times = <DateTime>[];
+    while (t.isBefore(end) || t.isAtSameMomentAs(end)) {
+      times.add(t);
+      t = t.add(step);
+    }
+
+    final spots = <FlSpot>[];
+    for (var i = 0; i < times.length; i++) {
+      final key = _keyForUtc(times[i]);
+      final entry = _readings[key];
+      final y = _extract(entry, metricKey);
+      final x = times[i].difference(times.first).inMinutes.toDouble();
+      spots.add(FlSpot(x, y));
+    }
+
+    final totalX = times.isNotEmpty ? times.last.difference(times.first).inMinutes.toDouble() : dur.inMinutes.toDouble();
+
+    // Compute highest datapoint within last 24 hours for this metric
+    double max24 = 0.0;
+    final start24 = end.subtract(const Duration(hours: 24));
+    DateTime tt = DateTime.utc(start24.year, start24.month, start24.day, start24.hour, (start24.minute ~/ 5) * 5);
+    if (tt.isBefore(start24)) tt = tt.add(step);
+    while (tt.isBefore(end) || tt.isAtSameMomentAs(end)) {
+      final k = _keyForUtc(tt);
+      final e = _readings[k];
+      final v = _extract(e, metricKey);
+      if (v > max24) max24 = v;
+      tt = tt.add(step);
+    }
+    final yMax = (max24 <= 0) ? 1.0 : max24 * 1.5;
+
+    // Constrain the visual chart area to a 4:3 landscape rectangle and not full-screen.
+    final screenW = MediaQuery.of(context).size.width;
+    final maxW = math.min(screenW * 0.95, 1000.0);
+
     return Scaffold(
-      body: Center(
-        child: Text('Power Data Page'),
+      appBar: AppBar(title: const Text('Power Data')),
+      body: Padding(
+        padding: const EdgeInsets.all(12.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: DropdownButton<int>(
+                    value: _metricIndex,
+                    isExpanded: true,
+                    items: List.generate(_metrics.length, (i) => DropdownMenuItem(value: i, child: Text(_metrics[i]['label']!))),
+                    onChanged: (v) {
+                      if (v == null) return;
+                      setState(() => _metricIndex = v);
+                    },
+                  ),
+                ),
+                const SizedBox(width: 12),
+                SizedBox(
+                  width: 160,
+                  child: DropdownButton<int>(
+                    value: _intervalIndex,
+                    isExpanded: true,
+                    items: List.generate(_intervals.length, (i) => DropdownMenuItem(value: i, child: Text(_intervals[i]['label'] as String))),
+                    onChanged: (v) {
+                      if (v == null) return;
+                      setState(() => _intervalIndex = v);
+                    },
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+
+            // Centered landscape card with aspect ratio 4:3
+            Center(
+              child: SizedBox(
+                width: maxW,
+                child: AspectRatio(
+                  aspectRatio: 4 / 3,
+                  child: Card(
+                    elevation: 4,
+                    child: Padding(
+                      padding: const EdgeInsets.all(12.0),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Text('${_metrics[_metricIndex]['label']} — last ${_intervals[_intervalIndex]['label']}', style: const TextStyle(fontWeight: FontWeight.w600)),
+                          const SizedBox(height: 8),
+                          Expanded(
+                            child: times.isEmpty
+                                ? const Center(child: Text('No data range'))
+                                : LineChart(
+                                    LineChartData(
+                                      minX: 0,
+                                      maxX: totalX,
+                                      minY: 0,
+                                      maxY: yMax,
+                                      lineBarsData: [
+                                        LineChartBarData(
+                                          spots: spots,
+                                          isCurved: true,
+                                          dotData: FlDotData(show: true),
+                                          belowBarData: BarAreaData(show: false),
+                                          color: Theme.of(context).colorScheme.primary,
+                                          barWidth: 2,
+                                        ),
+                                      ],
+                                      gridData: FlGridData(show: true),
+                                      titlesData: FlTitlesData(
+                                        bottomTitles: AxisTitles(
+                                          sideTitles: SideTitles(
+                                            showTitles: true,
+                                            reservedSize: 40,
+                                            interval: (totalX / 6).clamp(1, totalX),
+                                            getTitlesWidget: (value, meta) {
+                                              final dt = times.first.add(Duration(minutes: value.toInt()));
+                                              final h = dt.hour.toString().padLeft(2, '0');
+                                              final m = dt.minute.toString().padLeft(2, '0');
+                                              return Padding(
+                                                padding: const EdgeInsets.only(top: 8.0),
+                                                child: Text('$h:$m', style: const TextStyle(fontSize: 10)),
+                                              );
+                                            },
+                                          ),
+                                        ),
+                                        leftTitles: AxisTitles(sideTitles: SideTitles(showTitles: true, reservedSize: 48)),
+                                        topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                                        rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                                      ),
+                                      borderData: FlBorderData(show: true),
+                                    ),
+                                  ),
+                          ),
+                          const SizedBox(height: 8),
+                          Text('Values shown in $unit', style: const TextStyle(fontSize: 12, color: Colors.grey)),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -938,12 +1222,159 @@ class CameraRecordingsPage extends StatefulWidget {
 }
 
 class _CameraRecordingsPageState extends State<CameraRecordingsPage> {
+  final FirebaseStorage _storage = FirebaseStorage.instance;
+  List<Reference> _items = [];
+  bool _loading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadList();
+  }
+
+  Future<void> _loadList() async {
+    if (!mounted) return;
+    setState(() => _loading = true);
+    try {
+      final ref = _storage.ref().child('recordings');
+      final listResult = await ref.listAll();
+      setState(() => _items = List<Reference>.from(listResult.items));
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Failed to list recordings')));
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<bool> _ensurePermissions() async {
+    // request relevant permissions for saving to external storage.
+    try {
+      bool granted = false;
+      if (Platform.isAndroid) {
+        final storage = await Permission.storage.request();
+        // On Android 11+, requesting manageExternalStorage may be required
+        final manage = await Permission.manageExternalStorage.request();
+        granted = storage.isGranted || manage.isGranted;
+      } else if (Platform.isIOS) {
+        final photos = await Permission.photos.request();
+        granted = photos.isGranted;
+      } else {
+        // For other platforms, attempt storage permission
+        final storage = await Permission.storage.request();
+        granted = storage.isGranted;
+      }
+
+      if (granted) return true;
+
+      // Not granted — prompt user to open app settings to grant permission
+      if (!mounted) return false;
+      final open = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Permission required'),
+          content: const Text('The app needs storage permissions to save recordings to your device. Open app settings to grant permission?'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+            TextButton(onPressed: () => Navigator.pop(context, true), child: const Text('Open settings')),
+          ],
+        ),
+      );
+
+      if (open == true) {
+        await openAppSettings();
+      }
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _downloadAndSave(Reference ref) async {
+    if (!await _ensurePermissions()) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Storage/photos permission required')));
+      return;
+    }
+
+    final fileName = ref.name;
+    try {
+      final tempDir = await getTemporaryDirectory();
+      final localFile = File('${tempDir.path}/$fileName');
+
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Downloading...')));
+
+      final task = ref.writeToFile(localFile);
+      await task;
+
+      // Try to copy to the standard DCIM/Camera folder on Android. On modern
+      // Android versions this may require MANAGE_EXTERNAL_STORAGE or scoped
+      // storage handling; we'll attempt a best-effort copy and show the path.
+      if (Platform.isAndroid) {
+        final targetDir = Directory('/storage/emulated/0/DCIM/Camera');
+        try {
+          if (!await targetDir.exists()) await targetDir.create(recursive: true);
+          final dest = File('${targetDir.path}/$fileName');
+          await localFile.copy(dest.path);
+          if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Saved to ${dest.path}')));
+        } catch (e) {
+          if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Failed to copy file to DCIM/Camera')));
+        }
+      } else {
+        // For iOS and other platforms, leave the file in the temp dir and inform the user.
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Downloaded to ${localFile.path}')));
+      }
+
+      // cleanup temp file where possible
+      try { if (await localFile.exists()) await localFile.delete(); } catch (_) {}
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Download failed')));
+    }
+  }
+
+  Widget _buildItemTile(Reference ref) {
+    return FutureBuilder<FullMetadata>(
+      future: ref.getMetadata(),
+      builder: (context, snap) {
+  final sizeBytes = snap.data?.size ?? 0;
+  final subtitle = snap.hasData ? '${(sizeBytes / 1024 / 1024).toStringAsFixed(2)} MB' : null;
+        return ListTile(
+          leading: const Icon(Icons.videocam),
+          title: Text(ref.name),
+          subtitle: subtitle != null ? Text(subtitle) : null,
+          trailing: IconButton(icon: const Icon(Icons.download_rounded), onPressed: () => _downloadAndSave(ref)),
+          onTap: () => _downloadAndSave(ref),
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Center(
-        child: Text('Camera Recordings Page'),
+      appBar: AppBar(
+        title: const Text('Recordings'),
+        actions: [
+          IconButton(icon: const Icon(Icons.refresh), onPressed: _loadList, tooltip: 'Refresh'),
+        ],
       ),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : _items.isEmpty
+              ? Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      const Text('No recordings found'),
+                      const SizedBox(height: 8),
+                      ElevatedButton.icon(onPressed: _loadList, icon: const Icon(Icons.refresh), label: const Text('Refresh')),
+                    ],
+                  ),
+                )
+              : ListView.separated(
+                  padding: const EdgeInsets.all(12),
+                  itemCount: _items.length,
+                  separatorBuilder: (_, __) => const Divider(),
+                  itemBuilder: (context, index) => Card(child: _buildItemTile(_items[index])),
+                ),
     );
   }
 }
@@ -1086,7 +1517,7 @@ class _SettingsPageState extends State<SettingsPage> {
             controller: _panelController,
             keyboardType: const TextInputType.numberWithOptions(decimal: true),
             decoration: const InputDecoration(
-              labelText: 'Panel spec (W)',
+              labelText: 'Total Panel Wattage (W)',
               hintText: 'e.g. 1000.0',
             ),
           ),
@@ -1177,8 +1608,103 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 }
 
-// Helper to scope all database access under solar_data/users/<uid>
+//database access under solar_data/users/<uid>
 DatabaseReference userRef() {
   final uid = FirebaseAuth.instance.currentUser?.uid ?? 'unknown';
   return FirebaseDatabase.instance.ref().child('solar_data').child('users').child(uid);
 }
+
+// Default user data template imported for new accounts.
+const Map<String, dynamic> _dataTemplate = {
+  "lightingControls": {
+    "Kitchen": false,
+    "Living Room": false,
+    "Patio": false,
+    "Porch": false,
+  },
+  "powerData": {
+    "battery": 65,
+    "generation": 77,
+    "usage": 69,
+  },
+  "readings": {
+    "111120251000": {"current": 0.56, "power": 10.0, "temperature": 18.0, "voltage": 18.0, "timestamp_human": "2025-11-11T10:00:00Z"},
+    "111120251005": {"current": 0.69, "power": 12.5, "temperature": 18.4, "voltage": 18.0, "timestamp_human": "2025-11-11T10:05:00Z"},
+    "111120251010": {"current": 0.83, "power": 15.0, "temperature": 18.8, "voltage": 18.0, "timestamp_human": "2025-11-11T10:10:00Z"},
+    "111120251015": {"current": 0.97, "power": 17.5, "temperature": 19.2, "voltage": 18.0, "timestamp_human": "2025-11-11T10:15:00Z"},
+    "111120251020": {"current": 1.11, "power": 20.0, "temperature": 19.6, "voltage": 18.0, "timestamp_human": "2025-11-11T10:20:00Z"},
+    "111120251025": {"current": 1.25, "power": 22.5, "temperature": 20.0, "voltage": 18.0, "timestamp_human": "2025-11-11T10:25:00Z"},
+    "111120251030": {"current": 1.39, "power": 25.0, "temperature": 20.4, "voltage": 18.0, "timestamp_human": "2025-11-11T10:30:00Z"},
+    "111120251035": {"current": 1.53, "power": 27.5, "temperature": 20.8, "voltage": 18.0, "timestamp_human": "2025-11-11T10:35:00Z"},
+    "111120251040": {"current": 1.67, "power": 30.0, "temperature": 21.2, "voltage": 18.0, "timestamp_human": "2025-11-11T10:40:00Z"},
+    "111120251045": {"current": 1.81, "power": 32.5, "temperature": 21.6, "voltage": 18.0, "timestamp_human": "2025-11-11T10:45:00Z"},
+    "111120251050": {"current": 1.94, "power": 35.0, "temperature": 22.0, "voltage": 18.0, "timestamp_human": "2025-11-11T10:50:00Z"},
+    "111120251055": {"current": 2.08, "power": 37.5, "temperature": 22.4, "voltage": 18.0, "timestamp_human": "2025-11-11T10:55:00Z"},
+    "111120251100": {"current": 2.22, "power": 40.0, "temperature": 22.8, "voltage": 18.0, "timestamp_human": "2025-11-11T11:00:00Z"},
+    "111120251105": {"current": 2.36, "power": 42.5, "temperature": 23.2, "voltage": 18.0, "timestamp_human": "2025-11-11T11:05:00Z"},
+    "111120251110": {"current": 2.50, "power": 45.0, "temperature": 23.6, "voltage": 18.0, "timestamp_human": "2025-11-11T11:10:00Z"},
+    "111120251115": {"current": 2.64, "power": 47.5, "temperature": 24.0, "voltage": 18.0, "timestamp_human": "2025-11-11T11:15:00Z"},
+    "111120251120": {"current": 2.78, "power": 50.0, "temperature": 24.4, "voltage": 18.0, "timestamp_human": "2025-11-11T11:20:00Z"},
+    "111120251125": {"current": 2.92, "power": 52.5, "temperature": 24.8, "voltage": 18.0, "timestamp_human": "2025-11-11T11:25:00Z"},
+    "111120251130": {"current": 3.06, "power": 55.0, "temperature": 25.2, "voltage": 18.0, "timestamp_human": "2025-11-11T11:30:00Z"},
+    "111120251135": {"current": 3.19, "power": 57.5, "temperature": 25.6, "voltage": 18.0, "timestamp_human": "2025-11-11T11:35:00Z"},
+    "111120251140": {"current": 3.33, "power": 60.0, "temperature": 26.0, "voltage": 18.0, "timestamp_human": "2025-11-11T11:40:00Z"},
+    "111120251145": {"current": 3.47, "power": 62.5, "temperature": 26.4, "voltage": 18.0, "timestamp_human": "2025-11-11T11:45:00Z"},
+    "111120251150": {"current": 3.61, "power": 65.0, "temperature": 26.8, "voltage": 18.0, "timestamp_human": "2025-11-11T11:50:00Z"},
+    "111120251155": {"current": 3.75, "power": 67.5, "temperature": 27.2, "voltage": 18.0, "timestamp_human": "2025-11-11T11:55:00Z"},
+    "111120251200": {"current": 3.89, "power": 70.0, "temperature": 27.6, "voltage": 18.0, "timestamp_human": "2025-11-11T12:00:00Z"},
+    "111120251205": {"current": 4.03, "power": 72.5, "temperature": 28.0, "voltage": 18.0, "timestamp_human": "2025-11-11T12:05:00Z"},
+    "111120251210": {"current": 4.17, "power": 75.0, "temperature": 28.4, "voltage": 18.0, "timestamp_human": "2025-11-11T12:10:00Z"},
+    "111120251215": {"current": 4.31, "power": 77.5, "temperature": 28.8, "voltage": 18.0, "timestamp_human": "2025-11-11T12:15:00Z"},
+    "111120251220": {"current": 4.44, "power": 80.0, "temperature": 29.2, "voltage": 18.0, "timestamp_human": "2025-11-11T12:20:00Z"},
+    "111120251225": {"current": 4.58, "power": 82.5, "temperature": 29.6, "voltage": 18.0, "timestamp_human": "2025-11-11T12:25:00Z"},
+    "111120251230": {"current": 4.72, "power": 85.0, "temperature": 30.0, "voltage": 18.0, "timestamp_human": "2025-11-11T12:30:00Z"},
+    "111120251235": {"current": 4.86, "power": 87.5, "temperature": 30.4, "voltage": 18.0, "timestamp_human": "2025-11-11T12:35:00Z"},
+    "111120251300": {"current": 5.00, "power": 90.0, "temperature": 30.8, "voltage": 18.0, "timestamp_human": "2025-11-11T13:00:00Z"},
+    "111120251305": {"current": 5.14, "power": 92.5, "temperature": 31.2, "voltage": 18.0, "timestamp_human": "2025-11-11T13:05:00Z"},
+    "111120251310": {"current": 5.28, "power": 95.0, "temperature": 31.6, "voltage": 18.0, "timestamp_human": "2025-11-11T13:10:00Z"},
+    "111120251315": {"current": 5.42, "power": 97.5, "temperature": 32.0, "voltage": 18.0, "timestamp_human": "2025-11-11T13:15:00Z"},
+    "111120251320": {"current": 5.56, "power": 100.0, "temperature": 33.0, "voltage": 18.0, "timestamp_human": "2025-11-11T13:20:00Z"},
+    "111120251325": {"current": 5.43, "power": 97.8, "temperature": 32.9, "voltage": 18.0, "timestamp_human": "2025-11-11T13:25:00Z"},
+    "111120251330": {"current": 5.31, "power": 95.6, "temperature": 32.8, "voltage": 18.0, "timestamp_human": "2025-11-11T13:30:00Z"},
+    "111120251335": {"current": 5.19, "power": 93.3, "temperature": 32.7, "voltage": 18.0, "timestamp_human": "2025-11-11T13:35:00Z"},
+    "111120251340": {"current": 5.06, "power": 91.1, "temperature": 32.6, "voltage": 18.0, "timestamp_human": "2025-11-11T13:40:00Z"},
+    "111120251345": {"current": 4.94, "power": 88.9, "temperature": 32.5, "voltage": 18.0, "timestamp_human": "2025-11-11T13:45:00Z"},
+    "111120251350": {"current": 4.82, "power": 86.7, "temperature": 32.4, "voltage": 18.0, "timestamp_human": "2025-11-11T13:50:00Z"},
+    "111120251355": {"current": 4.69, "power": 84.4, "temperature": 32.3, "voltage": 18.0, "timestamp_human": "2025-11-11T13:55:00Z"},
+    "111120251400": {"current": 4.57, "power": 82.2, "temperature": 32.2, "voltage": 18.0, "timestamp_human": "2025-11-11T14:00:00Z"},
+    "111120251405": {"current": 4.44, "power": 80.0, "temperature": 32.1, "voltage": 18.0, "timestamp_human": "2025-11-11T14:05:00Z"},
+    "111120251410": {"current": 4.32, "power": 77.8, "temperature": 32.0, "voltage": 18.0, "timestamp_human": "2025-11-11T14:10:00Z"},
+    "111120251415": {"current": 4.20, "power": 75.6, "temperature": 31.9, "voltage": 18.0, "timestamp_human": "2025-11-11T14:15:00Z"},
+    "111120251420": {"current": 4.07, "power": 73.3, "temperature": 31.8, "voltage": 18.0, "timestamp_human": "2025-11-11T14:20:00Z"},
+    "111120251425": {"current": 3.95, "power": 71.1, "temperature": 31.7, "voltage": 18.0, "timestamp_human": "2025-11-11T14:25:00Z"},
+    "111120251430": {"current": 3.83, "power": 68.9, "temperature": 31.6, "voltage": 18.0, "timestamp_human": "2025-11-11T14:30:00Z"},
+    "111120251435": {"current": 3.70, "power": 66.7, "temperature": 31.5, "voltage": 18.0, "timestamp_human": "2025-11-11T14:35:00Z"},
+    "111120251440": {"current": 3.58, "power": 64.4, "temperature": 31.4, "voltage": 18.0, "timestamp_human": "2025-11-11T14:40:00Z"},
+    "111120251445": {"current": 3.46, "power": 62.2, "temperature": 31.3, "voltage": 18.0, "timestamp_human": "2025-11-11T14:45:00Z"},
+    "111120251450": {"current": 3.33, "power": 60.0, "temperature": 31.2, "voltage": 18.0, "timestamp_human": "2025-11-11T14:50:00Z"},
+    "111120251455": {"current": 3.21, "power": 57.8, "temperature": 31.1, "voltage": 18.0, "timestamp_human": "2025-11-11T14:55:00Z"},
+    "111120251500": {"current": 3.09, "power": 55.6, "temperature": 31.0, "voltage": 18.0, "timestamp_human": "2025-11-11T15:00:00Z"},
+    "111120251505": {"current": 2.96, "power": 53.3, "temperature": 30.9, "voltage": 18.0, "timestamp_human": "2025-11-11T15:05:00Z"},
+    "111120251510": {"current": 2.84, "power": 51.1, "temperature": 30.8, "voltage": 18.0, "timestamp_human": "2025-11-11T15:10:00Z"},
+    "111120251515": {"current": 2.72, "power": 48.9, "temperature": 30.7, "voltage": 18.0, "timestamp_human": "2025-11-11T15:15:00Z"},
+    "111120251520": {"current": 2.59, "power": 46.7, "temperature": 30.6, "voltage": 18.0, "timestamp_human": "2025-11-11T15:20:00Z"},
+    "111120251525": {"current": 2.47, "power": 44.4, "temperature": 30.5, "voltage": 18.0, "timestamp_human": "2025-11-11T15:25:00Z"},
+    "111120251530": {"current": 2.35, "power": 42.2, "temperature": 30.4, "voltage": 18.0, "timestamp_human": "2025-11-11T15:30:00Z"},
+    "111120251535": {"current": 2.22, "power": 40.0, "temperature": 30.3, "voltage": 18.0, "timestamp_human": "2025-11-11T15:35:00Z"},
+    "111120251540": {"current": 2.10, "power": 37.8, "temperature": 30.2, "voltage": 18.0, "timestamp_human": "2025-11-11T15:40:00Z"},
+    "111120251545": {"current": 1.98, "power": 35.6, "temperature": 30.1, "voltage": 18.0, "timestamp_human": "2025-11-11T15:45:00Z"},
+    "111120251550": {"current": 1.85, "power": 33.3, "temperature": 30.0, "voltage": 18.0, "timestamp_human": "2025-11-11T15:50:00Z"},
+    "111120251555": {"current": 1.73, "power": 31.1, "temperature": 29.9, "voltage": 18.0, "timestamp_human": "2025-11-11T15:55:00Z"},
+  },
+  "sensorData": {
+    "battery_temp": 70,
+    "motion": false,
+  },
+  "settings": {
+    "batteryCapacityMax": 24,
+    "darkMode": true,
+    "nightLightPref": 0,
+    "panelSpecW": 100,
+  },
+};
