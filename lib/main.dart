@@ -14,8 +14,9 @@ import 'package:fl_chart/fl_chart.dart';
 import 'dart:math' as math;
 import 'package:firebase_storage/firebase_storage.dart';
 import 'dart:io';
-import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:gallery_saver_plus/gallery_saver.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 
 /*
 App layout:
@@ -85,6 +86,75 @@ class SolarHomeLighting extends StatefulWidget {
 
 class _SolarHomeLightingState extends State<SolarHomeLighting> {
   ThemeMode _themeMode = ThemeMode.system;
+  static final FlutterLocalNotificationsPlugin _ln = FlutterLocalNotificationsPlugin();
+
+  @override
+  void initState() {
+    super.initState();
+    _initLocalNotifications();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _promptNotificationPermissionWithExplanation();
+    });
+  }
+
+  Future<void> _initLocalNotifications() async {
+    const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
+    final initSettings = InitializationSettings(android: androidSettings);
+    await _ln.initialize(
+      initSettings,
+      onDidReceiveNotificationResponse: (NotificationResponse response) async {
+        final payload = response.payload;
+        if (payload == 'recordings') {
+          // Try to switch tab immediately if home is active
+          final st = MyHomePage.navKey.currentState;
+          if (st is _MyHomePageState) {
+            st.setTab(3);
+          } else {
+            // Fallback: mark pending selection for next build
+            MyHomePage.lastSelectedIndex = 3;
+            MyHomePage.pendingNavigateToRecordings = true;
+          }
+        }
+      },
+    );
+    const androidChannel = AndroidNotificationChannel(
+      'motion_alerts',
+      'Motion Alerts',
+      description: 'Notifications when motion is detected',
+      importance: Importance.high,
+    );
+    final androidPlugin = _ln.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
+    await androidPlugin?.createNotificationChannel(androidChannel);
+  }
+
+  Future<void> _promptNotificationPermissionWithExplanation() async {
+    try {
+      if (!(Platform.isAndroid || Platform.isIOS)) return;
+      if (!mounted) return;
+      final proceed = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Allow Notifications?'),
+          content: const Text(
+            'Enable notifications to be alerted when motion is detected.\n' 
+            'You can change this anytime in Settings → Notify of activity.'
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Not now')),
+            TextButton(onPressed: () => Navigator.pop(context, true), child: const Text('Allow')),
+          ],
+        ),
+      );
+      if (proceed == true) {
+        final status = await Permission.notification.request();
+        if (!status.isGranted && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(content: Text('Notifications disabled — you can enable later in Settings')),
+          );
+        }
+      }
+    } catch (_) {}
+  }
 
   void _setDarkMode(bool enabled) {
     setState(() {
@@ -140,7 +210,7 @@ class _SolarHomeLightingState extends State<SolarHomeLighting> {
       themeMode: _themeMode,
       // Gate the app behind authentication; AuthGate will show LoginPage
       // when not signed in and MyHomePage when signed in.
-      home: AuthGate(themeMode: _themeMode, onThemeChanged: _setDarkMode),
+      home: AuthGate(themeMode: _themeMode, onThemeChanged: _setDarkMode, ln: _ln),
     );
   }
 }
@@ -149,8 +219,9 @@ class _SolarHomeLightingState extends State<SolarHomeLighting> {
 class AuthGate extends StatelessWidget {
   final ThemeMode themeMode;
   final void Function(bool) onThemeChanged;
+  final FlutterLocalNotificationsPlugin ln;
 
-  const AuthGate({super.key, required this.themeMode, required this.onThemeChanged});
+  const AuthGate({super.key, required this.themeMode, required this.onThemeChanged, required this.ln});
 
   @override
   Widget build(BuildContext context) {
@@ -163,7 +234,7 @@ class AuthGate extends StatelessWidget {
 
         if (snapshot.hasData && snapshot.data != null) {
           // Signed in
-          return MyHomePage(title: SolarHomeLighting.appTitle, themeMode: themeMode, onThemeChanged: onThemeChanged);
+          return MyHomePage(key: MyHomePage.navKey, title: SolarHomeLighting.appTitle, themeMode: themeMode, onThemeChanged: onThemeChanged, ln: ln);
         }
 
         return const LoginPage();
@@ -319,21 +390,88 @@ class _LoginPageState extends State<LoginPage> {
 }
 
 class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title, required this.themeMode, required this.onThemeChanged});
+  const MyHomePage({super.key, required this.title, required this.themeMode, required this.onThemeChanged, required this.ln});
 
   final String title;
   final ThemeMode themeMode;
   final void Function(bool) onThemeChanged;
+  final FlutterLocalNotificationsPlugin ln;
+
+  // Persist last selected tab across widget rebuilds (e.g., theme changes)
+  static int lastSelectedIndex = 0;
+  static bool pendingNavigateToRecordings = false;
+  static final GlobalKey navKey = GlobalKey();
 
   @override
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  int _selectedIndex = 0;
+  int _selectedIndex = MyHomePage.lastSelectedIndex;
   final database = userRef();
   int? _requestedMetricIndex;
   int? _requestedIntervalIndex;
+  StreamSubscription<DatabaseEvent>? _motionSub;
+  bool _notifyOfActivity = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadNotifyPref();
+    _subscribeMotion();
+    if (MyHomePage.pendingNavigateToRecordings) {
+      MyHomePage.pendingNavigateToRecordings = false;
+      _selectedIndex = 3;
+    }
+  }
+
+  Future<void> _loadNotifyPref() async {
+    try {
+      final snap = await userRef().child('settings').child('notifyOfActivity').get();
+      if (snap.exists) {
+        final v = snap.value;
+        final b = v is bool ? v : (v is String ? (v.toLowerCase() == 'true') : (v is num ? v != 0 : false));
+        setState(() => _notifyOfActivity = b);
+      }
+    } catch (_) {}
+  }
+
+  void _subscribeMotion() {
+    _motionSub?.cancel();
+    _motionSub = userRef().child('sensorData').child('motion').onValue.listen((event) async {
+      final val = event.snapshot.value;
+      final isMotion = val == true || (val is String && val.toLowerCase() == 'true') || (val is num && val != 0);
+      if (_notifyOfActivity && isMotion) {
+        await _showMotionNotification();
+      } else {
+        // Clear the persistent motion notification when motion ends or notifications disabled
+        try {
+          await widget.ln.cancel(1001);
+        } catch (_) {}
+      }
+    }, onError: (_) {});
+  }
+
+  Future<void> _showMotionNotification() async {
+    const details = NotificationDetails(
+      android: AndroidNotificationDetails(
+        'motion_alerts',
+        'Motion Alerts',
+        importance: Importance.high,
+        priority: Priority.high,
+        // Allow swipe-to-dismiss and dismiss on tap
+        ongoing: false,
+        autoCancel: true,
+      ),
+    );
+    await widget.ln.show(1001, 'Activity detected', 'Motion has been detected', details, payload: 'recordings');
+  }
+
+  @override
+  void dispose() {
+    _motionSub?.cancel();
+    super.dispose();
+  }
 
   Widget _buildPage(int index) {
     switch (index) {
@@ -354,7 +492,9 @@ class _MyHomePageState extends State<MyHomePage> {
       case 4:
         return const AboutPage();
       case 5:
-        return SettingsPage(themeMode: widget.themeMode, onThemeChanged: widget.onThemeChanged);
+        return SettingsPage(themeMode: widget.themeMode, onThemeChanged: widget.onThemeChanged, onNotifyPrefChanged: (b) {
+          setState(() => _notifyOfActivity = b);
+        });
       default:
         return const LandingPage();
     }
@@ -363,7 +503,13 @@ class _MyHomePageState extends State<MyHomePage> {
   void _onItemTapped(int index) {
     setState(() {
       _selectedIndex = index;
+      MyHomePage.lastSelectedIndex = index;
     });
+  }
+
+  // Expose method to programmatically change tab (used by notification tap)
+  void setTab(int index) {
+    _onItemTapped(index);
   }
 
   @override
@@ -396,13 +542,18 @@ class _MyHomePageState extends State<MyHomePage> {
         child: Column(
           children: [
             // Header + scrollable list
-            const DrawerHeader(
-              decoration: BoxDecoration(color: Color.fromARGB(255, 128, 0, 0)),
-              child: Text(
-                'Solar \nHome \nLighting \nMonitor',
-                style: TextStyle(
-                  color: Colors.white,
-                  fontSize: 20,
+            SizedBox(
+              width: double.infinity,
+              child: const DrawerHeader(
+                decoration: BoxDecoration(color: Color.fromARGB(255, 128, 0, 0)),
+                margin: EdgeInsets.zero,
+                padding: EdgeInsets.all(16),
+                child: Text(
+                  'Solar \nHome \nLighting \nMonitor',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 20,
+                  ),
                 ),
               ),
             ),
@@ -1054,18 +1205,36 @@ class _LightControlsPageState extends State<LightControlsPage> {
       lightingControlsRef.child(controls[index].name).set(value);
     } catch (e) {
       // If Firebase isn't available, we still update local UI.
-      // In production, handle errors or show a SnackBar.
+      // Show failure-only SnackBar when toggle cannot be confirmed/saved.
+      if (context.mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Failed to toggle — database unreachable')),
+        );
+      }
     }
   }
 
   void _addControl() {
+    final messenger = ScaffoldMessenger.of(context);
     setState(() {
       final newName = 'Light ${controls.length + 1}';
       controls.add(LightingControl(name: newName, isOn: false));
     });
+    // Try to persist a default OFF state in Firebase
+    final newName = controls.last.name;
+    lightingControlsRef.child(newName).set(false).then((_) {
+      messenger.showSnackBar(
+        SnackBar(content: Text('Added "$newName"')),
+      );
+    }).catchError((_) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Added locally, but failed to save to database')),
+      );
+    });
   }
 
   Future<void> _renameControl(int index) async {
+    final messenger = ScaffoldMessenger.of(context);
     final oldName = controls[index].name;
     final controller = TextEditingController(text: oldName);
     final result = await showDialog<String?>(
@@ -1093,13 +1262,20 @@ class _LightControlsPageState extends State<LightControlsPage> {
         final value = controls[index].isOn;
         await lightingControlsRef.child(result).set(value);
         await lightingControlsRef.child(oldName).remove();
+        messenger.showSnackBar(
+          SnackBar(content: Text('Renamed to "$result"')),
+        );
       } catch (e) {
         // handle errors as needed
+        messenger.showSnackBar(
+          const SnackBar(content: Text('Failed to rename control in database')),
+        );
       }
     }
   }
 
   Future<void> _removeControl(int index) async {
+    final messenger = ScaffoldMessenger.of(context);
     final name = controls[index].name;
     final confirm = await showDialog<bool?>(
       context: context,
@@ -1119,8 +1295,14 @@ class _LightControlsPageState extends State<LightControlsPage> {
       });
       try {
         await lightingControlsRef.child(name).remove();
+        messenger.showSnackBar(
+          SnackBar(content: Text('Removed "$name"')),
+        );
       } catch (e) {
         // handle errors as needed
+        messenger.showSnackBar(
+          const SnackBar(content: Text('Failed to remove control')),
+        );
       }
     }
   }
@@ -1290,43 +1472,23 @@ class _CameraRecordingsPageState extends State<CameraRecordingsPage> {
   }
 
   Future<void> _downloadAndSave(Reference ref) async {
+    // Use GallerySaver to download/save video directly to gallery.
     if (!await _ensurePermissions()) {
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Storage/photos permission required')));
       return;
     }
 
-    final fileName = ref.name;
     try {
-      final tempDir = await getTemporaryDirectory();
-      final localFile = File('${tempDir.path}/$fileName');
-
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Downloading...')));
-
-      final task = ref.writeToFile(localFile);
-      await task;
-
-      // Try to copy to the standard DCIM/Camera folder on Android. On modern
-      // Android versions this may require MANAGE_EXTERNAL_STORAGE or scoped
-      // storage handling; we'll attempt a best-effort copy and show the path.
-      if (Platform.isAndroid) {
-        final targetDir = Directory('/storage/emulated/0/DCIM/Camera');
-        try {
-          if (!await targetDir.exists()) await targetDir.create(recursive: true);
-          final dest = File('${targetDir.path}/$fileName');
-          await localFile.copy(dest.path);
-          if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Saved to ${dest.path}')));
-        } catch (e) {
-          if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Failed to copy file to DCIM/Camera')));
-        }
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Saving to gallery...')));
+      final url = await ref.getDownloadURL();
+      final ok = await GallerySaver.saveVideo(url, toDcim: true, albumName: 'Download');
+      if (ok == true) {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Saved to gallery Downloads')));
       } else {
-        // For iOS and other platforms, leave the file in the temp dir and inform the user.
-        if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Downloaded to ${localFile.path}')));
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Failed to save to gallery')));
       }
-
-      // cleanup temp file where possible
-      try { if (await localFile.exists()) await localFile.delete(); } catch (_) {}
     } catch (e) {
-      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Download failed')));
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Download/save failed')));
     }
   }
 
@@ -1432,8 +1594,9 @@ class AboutPage extends StatelessWidget {
 class SettingsPage extends StatefulWidget {
   final ThemeMode themeMode;
   final void Function(bool) onThemeChanged;
+  final void Function(bool)? onNotifyPrefChanged;
 
-  const SettingsPage({super.key, required this.themeMode, required this.onThemeChanged});
+  const SettingsPage({super.key, required this.themeMode, required this.onThemeChanged, this.onNotifyPrefChanged});
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -1443,6 +1606,7 @@ class _SettingsPageState extends State<SettingsPage> {
   int _nightPref = 0;
   late TextEditingController _panelController;
   late TextEditingController _batteryController;
+  bool _notifyOfActivity = false;
 
   @override
   void initState() {
@@ -1451,6 +1615,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _panelController = TextEditingController();
     _batteryController = TextEditingController();
     _loadSpecs();
+    _loadNotifyPref();
   }
   @override
   void dispose() {
@@ -1499,6 +1664,17 @@ class _SettingsPageState extends State<SettingsPage> {
     } catch (e) {
       // ignore load errors; keep default
     }
+  }
+
+  Future<void> _loadNotifyPref() async {
+    try {
+      final snap = await userRef().child('settings').child('notifyOfActivity').get();
+      if (snap.exists) {
+        final v = snap.value;
+        final b = v is bool ? v : (v is String ? (v.toLowerCase() == 'true') : (v is num ? v != 0 : false));
+        setState(() => _notifyOfActivity = b);
+      }
+    } catch (_) {}
   }
   @override
   Widget build(BuildContext context) {
@@ -1578,6 +1754,26 @@ class _SettingsPageState extends State<SettingsPage> {
                 }
               },
             ),
+          const SizedBox(height: 12),
+          SwitchListTile(
+            title: const Text('Notify of activity'),
+            subtitle: const Text('Send a notification when motion is detected'),
+            value: _notifyOfActivity,
+            onChanged: (value) async {
+              try {
+                await userRef().child('settings').child('notifyOfActivity').set(value);
+                setState(() => _notifyOfActivity = value);
+                widget.onNotifyPrefChanged?.call(value);
+              } catch (e) {
+                if (context.mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Failed to save notification preference')),
+                  );
+                }
+              }
+            },
+            secondary: const Icon(Icons.notifications_active),
+          ),
           const SizedBox(height: 16),
           SwitchListTile(
             title: const Text('Dark mode'),
