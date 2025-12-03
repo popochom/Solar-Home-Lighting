@@ -179,6 +179,7 @@ class _SolarHomeLightingState extends State<SolarHomeLighting> {
       elevatedButtonTheme: ElevatedButtonThemeData(
         style: ElevatedButton.styleFrom(
           backgroundColor: const Color.fromARGB(255, 128, 0, 0),
+          foregroundColor: Colors.white,
         ),
       ),
     );
@@ -199,6 +200,7 @@ class _SolarHomeLightingState extends State<SolarHomeLighting> {
       elevatedButtonTheme: ElevatedButtonThemeData(
         style: ElevatedButton.styleFrom(
           backgroundColor: const Color.fromARGB(255, 128, 0, 0),
+          foregroundColor: Colors.white,
         ),
       ),
     );
@@ -834,7 +836,7 @@ class _LandingPageState extends State<LandingPage> {
 
                     // Power Usage (watts)
                     GestureDetector(
-                      onTap: () => widget.onNavigateToPage?.call(1, metricIndex: 0),
+                      onTap: () => widget.onNavigateToPage?.call(1, metricIndex: 2),
                       child: infoCard(
                         title: 'Power Usage (W)',
                         child: SpeedometerPlaceholder(value: _usage, max: _panelMax, unit: 'W'),
@@ -938,8 +940,8 @@ class _PowerDataPageState extends State<PowerDataPage> {
   // Metrics the user can choose from
   final List<Map<String, String>> _metrics = [
     {"label": "Power (W)", "key": "power", "unit": "W"},
-    {"label": "Current (A)", "key": "current", "unit": "A"},
-    {"label": "Voltage (V)", "key": "voltage", "unit": "V"},
+    {"label": "Capacity (Ah)", "key": "current", "unit": "Ah"},
+    {"label": "Usage (W)", "key": "voltage", "unit": "W"},
     {"label": "Temperature (°C)", "key": "temperature", "unit": "°C"},
   ];
   int _metricIndex = 0;
@@ -1731,7 +1733,10 @@ class _SettingsPageState extends State<SettingsPage> {
                 if (context.mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Failed to save specifications')));
               }
             },
-            child: const Text('Save Specifications'),
+            style: ElevatedButton.styleFrom(
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Save Specifications', style: TextStyle(color: Colors.white)),
           ),
           const Text('Night lighting mode', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
             const SizedBox(height: 8),
@@ -1772,7 +1777,10 @@ class _SettingsPageState extends State<SettingsPage> {
                 }
               }
             },
-            secondary: const Icon(Icons.notifications_active),
+            secondary: Icon(
+              Icons.notifications_active,
+              color: _notifyOfActivity ? Colors.green : null,
+            ),
           ),
           const SizedBox(height: 16),
           SwitchListTile(
