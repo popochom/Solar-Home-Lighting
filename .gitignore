@@ -12,6 +12,9 @@
 .swiftpm/
 migrate_working_dir/
 
+#ignore pytorch files
+*.pth
+
 # IntelliJ related
 *.iml
 *.ipr

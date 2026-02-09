@@ -10,7 +10,7 @@
     "generation": 77,
     "usage": 69
   },
-  "readings": {
+  "readings": { 
     "111120251000": {"current": 0.56, "power": 10.0, "temperature": 18.0, "voltage": 18.0, "timestamp_human": "2025-11-11T10:00:00Z"},
     "111120251005": {"current": 0.69, "power": 12.5, "temperature": 18.4, "voltage": 18.0, "timestamp_human": "2025-11-11T10:05:00Z"},
     "111120251010": {"current": 0.83, "power": 15.0, "temperature": 18.8, "voltage": 18.0, "timestamp_human": "2025-11-11T10:10:00Z"},
@@ -82,7 +82,8 @@
   },
   "sensorData": {
     "battery_temp": 70,
-    "motion": false
+    "motion": false,
+    "humanActivity": false
   },
   "settings": {
     "batteryCapacityMax": 24,

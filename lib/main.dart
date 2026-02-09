@@ -1,11 +1,6 @@
-/*
-Solar Home Lighting App
-This is an app designed to control a smart home solar system. 
-It allows users to monitor the system, while also providing functions for
-switching lights and checking security cameras.
-*/
 
 import "package:flutter/material.dart";
+import 'package:shared_preferences/shared_preferences.dart';
 import "package:firebase_core/firebase_core.dart";
 import "package:firebase_database/firebase_database.dart";
 import "package:firebase_auth/firebase_auth.dart";
@@ -17,6 +12,15 @@ import 'dart:io';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:gallery_saver_plus/gallery_saver.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+
+// Global userKey variable
+String? userKey;
+
+// Load userKey from local storage at app start
+Future<void> loadUserKey() async {
+  final prefs = await SharedPreferences.getInstance();
+  userKey = prefs.getString('userKey');
+}
 
 /*
 App layout:
@@ -70,6 +74,7 @@ Helper functions:
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await Firebase.initializeApp();
+  await loadUserKey();
   runApp(SolarHomeLighting());
 }
 
@@ -266,11 +271,19 @@ class _LoginPageState extends State<LoginPage> {
   Future<void> _signIn() async {
     setState(() => _loading = true);
     try {
-      await FirebaseAuth.instance.signInWithEmailAndPassword(
+      final cred = await FirebaseAuth.instance.signInWithEmailAndPassword(
         email: _emailController.text.trim(),
         password: _passwordController.text,
       );
-      // on success, AuthGate's stream will update and show the main app
+      // Always reload userKey from Firebase and update local/global
+      final uid = cred.user?.uid;
+      if (uid != null) {
+        final ref = FirebaseDatabase.instance.ref().child('solar_data').child('users').child(uid).child('userKey');
+        final snap = await ref.get();
+        userKey = snap.value?.toString() ?? uid;
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('userKey', userKey!);
+      }
     } on FirebaseAuthException catch (e) {
       await _showMessage(e.message ?? 'Sign-in failed');
     } catch (_) {
@@ -296,6 +309,12 @@ class _LoginPageState extends State<LoginPage> {
           final uid = user.uid;
           final ref = FirebaseDatabase.instance.ref().child('solar_data').child('users').child(uid);
           await ref.set(_dataTemplate);
+          // Generate and store a userKey for new users
+          final newUserKey = uid; // Or use a more complex key if needed
+          await ref.child('userKey').set(newUserKey);
+          userKey = newUserKey;
+          final prefs = await SharedPreferences.getInstance();
+          await prefs.setString('userKey', userKey!);
         } catch (e) {
           // If writing the template fails, still consider the account created,
           // but inform the user.
@@ -303,6 +322,16 @@ class _LoginPageState extends State<LoginPage> {
           if (mounted) setState(() => _loading = false);
           return;
         }
+      }
+
+      // Force reload userKey from Firebase after registration
+      final uid = cred.user?.uid;
+      if (uid != null) {
+        final ref = FirebaseDatabase.instance.ref().child('solar_data').child('users').child(uid).child('userKey');
+        final snap = await ref.get();
+        userKey = snap.value?.toString() ?? uid;
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.setString('userKey', userKey!);
       }
 
       await _showMessage('Account created — signed in');
@@ -420,7 +449,7 @@ class _MyHomePageState extends State<MyHomePage> {
   void initState() {
     super.initState();
     _loadNotifyPref();
-    _subscribeMotion();
+    _subscribeActivityNotifications();
     if (MyHomePage.pendingNavigateToRecordings) {
       MyHomePage.pendingNavigateToRecordings = false;
       _selectedIndex = 3;
@@ -438,15 +467,42 @@ class _MyHomePageState extends State<MyHomePage> {
     } catch (_) {}
   }
 
-  void _subscribeMotion() {
+  StreamSubscription? _activitySub;
+  void _subscribeActivityNotifications() {
     _motionSub?.cancel();
-    _motionSub = userRef().child('sensorData').child('motion').onValue.listen((event) async {
-      final val = event.snapshot.value;
-      final isMotion = val == true || (val is String && val.toLowerCase() == 'true') || (val is num && val != 0);
-      if (_notifyOfActivity && isMotion) {
+    _activitySub?.cancel();
+    final db = userRef();
+    _activitySub = db.child('sensorData').onValue.listen((event) async {
+      final snap = event.snapshot.value;
+      bool isMotion = false;
+      bool isHuman = false;
+      if (snap is Map) {
+        final m = snap['motion'];
+        final h = snap['humanActivity'];
+        isMotion = m == true || (m is String && m.toLowerCase() == 'true') || (m is num && m != 0);
+        isHuman = h == true || (h is String && h.toLowerCase() == 'true') || (h is num && h != 0);
+      }
+      // Get nightLightPref from settings
+      final nightPrefSnap = await db.child('settings').child('nightLightPref').get();
+      int nightPref = 0;
+      if (nightPrefSnap.exists) {
+        final v = nightPrefSnap.value;
+        if (v is int) {
+          nightPref = v;
+        }
+        else if (v is String) {
+          nightPref = int.tryParse(v) ?? 0;
+        }
+      }
+      // 0: off, 1: motion, 2: humanActivity
+      bool shouldNotify = false;
+      if (_notifyOfActivity) {
+        if (nightPref == 1 && isMotion) shouldNotify = true;
+        if (nightPref == 2 && isHuman) shouldNotify = true;
+      }
+      if (shouldNotify) {
         await _showMotionNotification();
       } else {
-        // Clear the persistent motion notification when motion ends or notifications disabled
         try {
           await widget.ln.cancel(1001);
         } catch (_) {}
@@ -472,6 +528,7 @@ class _MyHomePageState extends State<MyHomePage> {
   @override
   void dispose() {
     _motionSub?.cancel();
+    _activitySub?.cancel();
     super.dispose();
   }
 
@@ -1420,7 +1477,8 @@ class _CameraRecordingsPageState extends State<CameraRecordingsPage> {
     if (!mounted) return;
     setState(() => _loading = true);
     try {
-      final ref = _storage.ref().child('recordings');
+      final key = userKey ?? 'unknown';
+      final ref = _storage.ref().child('recordings').child(key);
       final listResult = await ref.listAll();
       setState(() => _items = List<Reference>.from(listResult.items));
     } catch (e) {
@@ -1605,10 +1663,7 @@ class SettingsPage extends StatefulWidget {
 }
 
 class _SettingsPageState extends State<SettingsPage> {
-  int _nightPref = 0;
-  late TextEditingController _panelController;
-  late TextEditingController _batteryController;
-  bool _notifyOfActivity = false;
+  String? _localUserKey;
 
   @override
   void initState() {
@@ -1618,7 +1673,26 @@ class _SettingsPageState extends State<SettingsPage> {
     _batteryController = TextEditingController();
     _loadSpecs();
     _loadNotifyPref();
+    _loadUserKeyLocal();
   }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _loadUserKeyLocal();
+  }
+
+  Future<void> _loadUserKeyLocal() async {
+    final prefs = await SharedPreferences.getInstance();
+    String? stored = prefs.getString('userKey');
+    setState(() {
+      _localUserKey = stored ?? userKey;
+    });
+  }
+  int _nightPref = 0;
+  late TextEditingController _panelController;
+  late TextEditingController _batteryController;
+  bool _notifyOfActivity = false;
   @override
   void dispose() {
     _panelController.dispose();
@@ -1741,16 +1815,15 @@ class _SettingsPageState extends State<SettingsPage> {
           const Text('Night lighting mode', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
             const SizedBox(height: 8),
             DropdownButton<int>(
-              value: _nightPref,
+              value: _nightPref == 2 ? 2 : 1, // Only allow 1 or 2 in UI
               items: const [
-                DropdownMenuItem(value: 0, child: Text('Off')),
                 DropdownMenuItem(value: 1, child: Text('Motion')),
                 DropdownMenuItem(value: 2, child: Text('Human Activity')),
               ],
               onChanged: (v) async {
                 if (v == null) return;
                 try {
-                    await userRef().child('settings').child('nightLightPref').set(v);
+                  await userRef().child('settings').child('nightLightPref').set(v);
                   setState(() => _nightPref = v);
                 } catch (e) {
                   if(context.mounted){
@@ -1762,11 +1835,22 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 12),
           SwitchListTile(
             title: const Text('Notify of activity'),
-            subtitle: const Text('Send a notification when motion is detected'),
+            subtitle: const Text('Send a notification when selected activity is detected'),
             value: _notifyOfActivity,
             onChanged: (value) async {
               try {
                 await userRef().child('settings').child('notifyOfActivity').set(value);
+                // Set nightLightPref to 0 if notifications are off, else keep current (or default to 1)
+                if (!value) {
+                  await userRef().child('settings').child('nightLightPref').set(0);
+                  setState(() => _nightPref = 0);
+                } else {
+                  // If turning on, set to 1 (motion) if not already 1 or 2
+                  if (_nightPref != 1 && _nightPref != 2) {
+                    await userRef().child('settings').child('nightLightPref').set(1);
+                    setState(() => _nightPref = 1);
+                  }
+                }
                 setState(() => _notifyOfActivity = value);
                 widget.onNotifyPrefChanged?.call(value);
               } catch (e) {
@@ -1805,6 +1889,22 @@ class _SettingsPageState extends State<SettingsPage> {
               setState(() {});
             },
             secondary: const Icon(Icons.brightness_6),
+          ),
+          const SizedBox(height: 32),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Text(
+                'User Key: ${_localUserKey ?? userKey ?? "(not available)"}',
+                style: const TextStyle(fontSize: 12, color: Colors.grey),
+                textAlign: TextAlign.center,
+              ),
+              IconButton(
+                icon: const Icon(Icons.refresh, size: 16, color: Colors.grey),
+                tooltip: 'Refresh User Key',
+                onPressed: _loadUserKeyLocal,
+              ),
+            ],
           ),
         ],
       ),
@@ -1904,6 +2004,7 @@ const Map<String, dynamic> _dataTemplate = {
   "sensorData": {
     "battery_temp": 70,
     "motion": false,
+    "humanActivity": false,
   },
   "settings": {
     "batteryCapacityMax": 24,
