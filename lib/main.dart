@@ -90,8 +90,12 @@ class SolarHomeLighting extends StatefulWidget {
 }
 
 class _SolarHomeLightingState extends State<SolarHomeLighting> {
+
   ThemeMode _themeMode = ThemeMode.system;
   static final FlutterLocalNotificationsPlugin _ln = FlutterLocalNotificationsPlugin();
+  bool _autoDarkMode = false;
+  StreamSubscription<DatabaseEvent>? _luxSub;
+  bool _autoDarkModeLoading = false;
 
   @override
   void initState() {
@@ -100,6 +104,73 @@ class _SolarHomeLightingState extends State<SolarHomeLighting> {
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _promptNotificationPermissionWithExplanation();
     });
+    _loadAutoDarkMode();
+  }
+  @override
+  void dispose() {
+    _luxSub?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _loadAutoDarkMode() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final val = prefs.getBool('autoDarkMode');
+      setState(() {
+        _autoDarkMode = val ?? false;
+      });
+      _setupLuxListener();
+    } catch (_) {}
+  }
+
+  void _setupLuxListener() {
+    _luxSub?.cancel();
+    if (!_autoDarkMode) return;
+    final db = userRef();
+    _luxSub = db.child('sensorData').child('lux').onValue.listen((event) {
+      final v = event.snapshot.value;
+      double lux = 100.0;
+      if (v is num) lux = v.toDouble();
+      else if (v is String) lux = double.tryParse(v) ?? 100.0;
+      if (_autoDarkMode) {
+        final shouldBeDark = lux < 10;
+        final isDark = (_themeMode == ThemeMode.dark);
+        if (shouldBeDark != isDark) {
+          setState(() {
+            _themeMode = shouldBeDark ? ThemeMode.dark : ThemeMode.light;
+          });
+        }
+      }
+    });
+  }
+
+  Future<void> _setAutoDarkMode(bool enabled) async {
+    setState(() {
+      _autoDarkMode = enabled;
+    });
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('autoDarkMode', enabled);
+    _setupLuxListener();
+    if (enabled) {
+      await _checkLuxAndSetTheme();
+    }
+  }
+
+  Future<void> _checkLuxAndSetTheme() async {
+    setState(() => _autoDarkModeLoading = true);
+    try {
+      final luxSnap = await userRef().child('sensorData').child('lux').get();
+      double lux = 100.0;
+      if (luxSnap.exists) {
+        final v = luxSnap.value;
+        if (v is num) lux = v.toDouble();
+        else if (v is String) lux = double.tryParse(v) ?? 100.0;
+      }
+      setState(() {
+        _themeMode = (lux < 10) ? ThemeMode.dark : ThemeMode.light;
+      });
+    } catch (_) {}
+    setState(() => _autoDarkModeLoading = false);
   }
 
   Future<void> _initLocalNotifications() async {
@@ -215,20 +286,32 @@ class _SolarHomeLightingState extends State<SolarHomeLighting> {
       theme: light,
       darkTheme: dark,
       themeMode: _themeMode,
-      // Gate the app behind authentication; AuthGate will show LoginPage
-      // when not signed in and MyHomePage when signed in.
-      home: AuthGate(themeMode: _themeMode, onThemeChanged: _setDarkMode, ln: _ln),
+      home: AuthGate(
+        themeMode: _themeMode,
+        onThemeChanged: (bool dark) {
+          if (_autoDarkMode) return; // ignore manual toggle if auto is on
+          _setDarkMode(dark);
+        },
+        ln: _ln,
+        autoDarkMode: _autoDarkMode,
+        onAutoDarkModeChanged: _setAutoDarkMode,
+        autoDarkModeLoading: _autoDarkModeLoading,
+      ),
     );
   }
 }
 
 // Authentication gate: shows LoginPage when not signed-in, otherwise the main app
+
 class AuthGate extends StatelessWidget {
   final ThemeMode themeMode;
   final void Function(bool) onThemeChanged;
   final FlutterLocalNotificationsPlugin ln;
+  final bool autoDarkMode;
+  final Future<void> Function(bool)? onAutoDarkModeChanged;
+  final bool autoDarkModeLoading;
 
-  const AuthGate({super.key, required this.themeMode, required this.onThemeChanged, required this.ln});
+  const AuthGate({super.key, required this.themeMode, required this.onThemeChanged, required this.ln, required this.autoDarkMode, this.onAutoDarkModeChanged, this.autoDarkModeLoading = false});
 
   @override
   Widget build(BuildContext context) {
@@ -241,7 +324,16 @@ class AuthGate extends StatelessWidget {
 
         if (snapshot.hasData && snapshot.data != null) {
           // Signed in
-          return MyHomePage(key: MyHomePage.navKey, title: SolarHomeLighting.appTitle, themeMode: themeMode, onThemeChanged: onThemeChanged, ln: ln);
+          return MyHomePage(
+            key: MyHomePage.navKey,
+            title: SolarHomeLighting.appTitle,
+            themeMode: themeMode,
+            onThemeChanged: onThemeChanged,
+            ln: ln,
+            autoDarkMode: autoDarkMode,
+            onAutoDarkModeChanged: onAutoDarkModeChanged,
+            autoDarkModeLoading: autoDarkModeLoading,
+          );
         }
 
         return const LoginPage();
@@ -420,13 +512,26 @@ class _LoginPageState extends State<LoginPage> {
   }
 }
 
+
 class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title, required this.themeMode, required this.onThemeChanged, required this.ln});
+  const MyHomePage({
+    super.key,
+    required this.title,
+    required this.themeMode,
+    required this.onThemeChanged,
+    required this.ln,
+    required this.autoDarkMode,
+    this.onAutoDarkModeChanged,
+    this.autoDarkModeLoading = false,
+  });
 
   final String title;
   final ThemeMode themeMode;
   final void Function(bool) onThemeChanged;
   final FlutterLocalNotificationsPlugin ln;
+  final bool autoDarkMode;
+  final Future<void> Function(bool)? onAutoDarkModeChanged;
+  final bool autoDarkModeLoading;
 
   // Persist last selected tab across widget rebuilds (e.g., theme changes)
   static int lastSelectedIndex = 0;
@@ -443,92 +548,104 @@ class _MyHomePageState extends State<MyHomePage> {
   int? _requestedMetricIndex;
   int? _requestedIntervalIndex;
   StreamSubscription<DatabaseEvent>? _motionSub;
+  StreamSubscription<DatabaseEvent>? _activityPrefSub;
+  StreamSubscription<DatabaseEvent>? _motionWatchSub;
+  StreamSubscription<DatabaseEvent>? _humanWatchSub;
   bool _notifyOfActivity = false;
+  int _nightLightPref = 0;
+  bool _lastMotion = false;
+  bool _lastHuman = false;
 
   @override
   void initState() {
     super.initState();
-    _loadNotifyPref();
-    _subscribeActivityNotifications();
+    _subscribeActivitySettings();
     if (MyHomePage.pendingNavigateToRecordings) {
       MyHomePage.pendingNavigateToRecordings = false;
       _selectedIndex = 3;
     }
   }
 
-  Future<void> _loadNotifyPref() async {
-    try {
-      final snap = await userRef().child('settings').child('notifyOfActivity').get();
-      if (snap.exists) {
-        final v = snap.value;
-        final b = v is bool ? v : (v is String ? (v.toLowerCase() == 'true') : (v is num ? v != 0 : false));
-        setState(() => _notifyOfActivity = b);
-      }
-    } catch (_) {}
-  }
-
-  StreamSubscription? _activitySub;
-  void _subscribeActivityNotifications() {
-    _motionSub?.cancel();
-    _activitySub?.cancel();
+  void _subscribeActivitySettings() {
+    // Listen for changes to notifyOfActivity and nightLightPref
+    _activityPrefSub?.cancel();
     final db = userRef();
-    _activitySub = db.child('sensorData').onValue.listen((event) async {
+    _activityPrefSub = db.child('settings').onValue.listen((event) {
       final snap = event.snapshot.value;
-      bool isMotion = false;
-      bool isHuman = false;
-      if (snap is Map) {
-        final m = snap['motion'];
-        final h = snap['humanActivity'];
-        isMotion = m == true || (m is String && m.toLowerCase() == 'true') || (m is num && m != 0);
-        isHuman = h == true || (h is String && h.toLowerCase() == 'true') || (h is num && h != 0);
-      }
-      // Get nightLightPref from settings
-      final nightPrefSnap = await db.child('settings').child('nightLightPref').get();
+      bool notify = false;
       int nightPref = 0;
-      if (nightPrefSnap.exists) {
-        final v = nightPrefSnap.value;
-        if (v is int) {
-          nightPref = v;
-        }
-        else if (v is String) {
-          nightPref = int.tryParse(v) ?? 0;
-        }
+      if (snap is Map) {
+        final n = snap['notifyOfActivity'];
+        notify = n is bool ? n : (n is String ? n.toLowerCase() == 'true' : (n is num ? n != 0 : false));
+        final v = snap['nightLightPref'];
+        if (v is int) nightPref = v;
+        else if (v is String) nightPref = int.tryParse(v) ?? 0;
       }
-      // 0: off, 1: motion, 2: humanActivity
-      bool shouldNotify = false;
-      if (_notifyOfActivity) {
-        if (nightPref == 1 && isMotion) shouldNotify = true;
-        if (nightPref == 2 && isHuman) shouldNotify = true;
-      }
-      if (shouldNotify) {
-        await _showMotionNotification();
-      } else {
-        try {
-          await widget.ln.cancel(1001);
-        } catch (_) {}
-      }
-    }, onError: (_) {});
+      setState(() {
+        _notifyOfActivity = notify;
+        _nightLightPref = nightPref;
+      });
+      _subscribeMotionOrHuman();
+    });
   }
 
-  Future<void> _showMotionNotification() async {
+  void _subscribeMotionOrHuman() {
+    _motionWatchSub?.cancel();
+    _humanWatchSub?.cancel();
+    final db = userRef();
+    if (!_notifyOfActivity) {
+      _lastMotion = false;
+      _lastHuman = false;
+      return;
+    }
+    if (_nightLightPref == 1) {
+      // Listen for motion
+      _motionWatchSub = db.child('sensorData').child('motion').onValue.listen((event) {
+        final v = event.snapshot.value;
+        final isMotion = v == true || (v is String && v.toLowerCase() == 'true') || (v is num && v != 0);
+        if (!_lastMotion && isMotion) {
+          _showMotionNotification(type: 'Motion Detected');
+        }
+        _lastMotion = isMotion;
+      });
+      _lastHuman = false;
+    } else if (_nightLightPref == 2) {
+      // Listen for human activity
+      _humanWatchSub = db.child('sensorData').child('humanActivity').child('detected').onValue.listen((event) {
+        final v = event.snapshot.value;
+        final isHuman = v == true || (v is String && v.toLowerCase() == 'true') || (v is num && v != 0);
+        if (!_lastHuman && isHuman) {
+          _showMotionNotification(type: 'Human Activity Detected');
+        }
+        _lastHuman = isHuman;
+      });
+      _lastMotion = false;
+    } else {
+      _lastMotion = false;
+      _lastHuman = false;
+    }
+  }
+
+  Future<void> _showMotionNotification({String type = 'Motion Detected'}) async {
     const details = NotificationDetails(
       android: AndroidNotificationDetails(
         'motion_alerts',
         'Motion Alerts',
         importance: Importance.high,
         priority: Priority.high,
-        // Allow swipe-to-dismiss and dismiss on tap
         ongoing: false,
         autoCancel: true,
       ),
     );
-    await widget.ln.show(1001, 'Activity detected', 'Motion has been detected', details, payload: 'recordings');
+    await widget.ln.show(1001, type, 'Motion has been detected', details, payload: 'recordings');
   }
 
   @override
   void dispose() {
     _motionSub?.cancel();
-    _activitySub?.cancel();
+    _activityPrefSub?.cancel();
+    _motionWatchSub?.cancel();
+    _humanWatchSub?.cancel();
     super.dispose();
   }
 
@@ -551,9 +668,16 @@ class _MyHomePageState extends State<MyHomePage> {
       case 4:
         return const AboutPage();
       case 5:
-        return SettingsPage(themeMode: widget.themeMode, onThemeChanged: widget.onThemeChanged, onNotifyPrefChanged: (b) {
-          setState(() => _notifyOfActivity = b);
-        });
+        return SettingsPage(
+          themeMode: widget.themeMode,
+          onThemeChanged: widget.onThemeChanged,
+          onNotifyPrefChanged: (b) {
+            setState(() => _notifyOfActivity = b);
+          },
+          autoDarkMode: widget.autoDarkMode,
+          onAutoDarkModeChanged: widget.onAutoDarkModeChanged,
+          autoDarkModeLoading: widget.autoDarkModeLoading,
+        );
       default:
         return const LandingPage();
     }
@@ -727,10 +851,14 @@ class _LandingPageState extends State<LandingPage> {
   double _generation = 0.0;
   double _battery = 0.0;
   double _usage = 0.0;
-  double _batteryTemp = 0.0;
+  double _efficiency = 0.0;
   // Configurable maxima (from settings)
   double _panelMax = 1000.0;
   double _batteryMax = 100.0;
+
+  // Brightness (lux) state
+  double? _lux;
+  StreamSubscription<DatabaseEvent>? _luxSub;
 
   StreamSubscription<DatabaseEvent>? _genSub;
   StreamSubscription<DatabaseEvent>? _batSub;
@@ -743,70 +871,76 @@ class _LandingPageState extends State<LandingPage> {
   void initState() {
     super.initState();
     _startPowerListeners();
+    _startLuxListener();
+  }
+
+  void _startLuxListener() {
+    _luxSub?.cancel();
+    final db = userRef();
+    _luxSub = db.child('sensorData').child('lux').onValue.listen((event) {
+      final v = event.snapshot.value;
+      double lux = 100.0;
+      if (v is num) lux = v.toDouble();
+      else if (v is String) lux = double.tryParse(v) ?? 100.0;
+      if (mounted) setState(() => _lux = lux);
+    }, onError: (_) {});
   }
 
   void _startPowerListeners() {
     final db = userRef();
 
-    _genSub = db.child('powerData').child('generation').onValue.listen((event) {
+    _genSub = db.child('powerData').child('pin_w').onValue.listen((event) {
       final v = _parseFirebaseNumeric(event.snapshot.value);
       if (mounted) setState(() => _generation = v);
-    }, onError: (_) {});
+    }, onError: (_){ });
 
-    _batSub = db.child('powerData').child('battery').onValue.listen((event) {
+    _batSub = db.child('powerData').child('battery_pct').onValue.listen((event) {
       final v = _parseFirebaseNumeric(event.snapshot.value);
       if (mounted) setState(() => _battery = v);
-    }, onError: (_) {});
+    }, onError: (_){ });
 
-    _useSub = db.child('powerData').child('usage').onValue.listen((event) {
+    _useSub = db.child('powerData').child('pout_w').onValue.listen((event) {
       final v = _parseFirebaseNumeric(event.snapshot.value);
       if (mounted) setState(() => _usage = v);
-    }, onError: (_) {});
+    }, onError: (_){ });
 
     // listen for configurable maxima in settings
     _panelMaxSub = db.child('settings').child('panelSpecW').onValue.listen((event) {
       final v = _parseFirebaseNumeric(event.snapshot.value);
       if (v > 0 && mounted) setState(() => _panelMax = v);
-    }, onError: (_) {});
+    }, onError: (_){ });
 
     _batteryMaxSub = db.child('settings').child('batteryCapacityMax').onValue.listen((event) {
       final v = _parseFirebaseNumeric(event.snapshot.value);
       if (v > 0 && mounted) setState(() => _batteryMax = v);
-    }, onError: (_) {});
+    }, onError: (_){ });
 
-    // sensorData (battery temperature)
-    _sensorSub = db.child('sensorData').onValue.listen((event) {
-      try {
-        final snap = event.snapshot.value;
-        if (snap is Map && snap.containsKey('battery_temp')) {
-          final v = snap['battery_temp'];
-          final parsed = _parseFirebaseNumeric(v);
-          if (mounted) setState(() => _batteryTemp = parsed);
-        } else if (snap is Map && snap.containsKey('battery_Temp')) {
-          final v = snap['battery_Temp'];
-          final parsed = _parseFirebaseNumeric(v);
-          if (mounted) setState(() => _batteryTemp = parsed);
-        }
-      } catch (_) {}
-    }, onError: (_) {});
+    // Conversion efficiency (%)
+    _sensorSub = db.child('powerData').child('eff_pct').onValue.listen((event) {
+      final v = _parseFirebaseNumeric(event.snapshot.value);
+      if (mounted) setState(() => _efficiency = v);
+    }, onError: (_){ });
   }
 
   Future<void> _manualRefresh() async {
     try {
-  final db = userRef();
-  final genSnap = await db.child('powerData').child('generation').get();
-  final batSnap = await db.child('powerData').child('battery').get();
-  final useSnap = await db.child('powerData').child('usage').get();
+      final db = userRef();
+      final genSnap = await db.child('powerData').child('pin_w').get();
+      final batSnap = await db.child('powerData').child('battery_pct').get();
+      final useSnap = await db.child('powerData').child('pout_w').get();
+      final effSnap = await db.child('powerData').child('eff_pct').get();
 
       final gen = _parseFirebaseNumeric(genSnap.value);
       final bat = _parseFirebaseNumeric(batSnap.value);
       final use = _parseFirebaseNumeric(useSnap.value);
+      final eff = _parseFirebaseNumeric(effSnap.value);
 
       if (mounted) {
         setState(() {
           _generation = gen;
           _battery = bat;
           _usage = use;
+          _efficiency = eff;
         });
       }
     } catch (e) {
@@ -831,6 +965,7 @@ class _LandingPageState extends State<LandingPage> {
     _panelMaxSub?.cancel();
     _batteryMaxSub?.cancel();
     _sensorSub?.cancel();
+    _luxSub?.cancel();
     super.dispose();
   }
   @override
@@ -847,10 +982,35 @@ class _LandingPageState extends State<LandingPage> {
             children: [
               Text(title, style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: colorScheme.onSurface)),
               const SizedBox(height: 8),
-              // Use Flexible with a loose fit so the child may size itself
-              // without forcing overflow in tight cards (fixes small bottom
-              // overflow in the Weather card).
               Flexible(fit: FlexFit.loose, child: child),
+            ],
+          ),
+        ),
+      );
+    }
+
+    // Brightness widget
+    Widget brightnessCard() {
+      final lux = _lux;
+      String label;
+      if (lux == null) {
+        label = "Brightness: (loading...)";
+      } else {
+        final isNight = lux < 10;
+        label = "Brightness: ${isNight ? "Night" : "Day"} (Lux: ${lux.toStringAsFixed(0)})";
+      }
+      return Card(
+        color: colorScheme.surfaceVariant,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        elevation: 4,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 18.0, horizontal: 16.0),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.brightness_6, color: colorScheme.primary),
+              const SizedBox(width: 12),
+              Text(label, style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600, color: colorScheme.onSurface)),
             ],
           ),
         ),
@@ -862,52 +1022,60 @@ class _LandingPageState extends State<LandingPage> {
         padding: const EdgeInsets.all(12.0),
         child: Stack(
           children: [
-            // Grid of cards that also responds to taps to trigger a manual refresh
             Positioned.fill(
               child: GestureDetector(
                 behavior: HitTestBehavior.opaque,
                 onTap: _manualRefresh,
-                child: GridView.count(
-                  crossAxisCount: 2,
-                  crossAxisSpacing: 12,
-                  mainAxisSpacing: 12,
+                child: Column(
                   children: [
-                    // Current Generation (watts)
-                    GestureDetector(
-                      onTap: () => widget.onNavigateToPage?.call(1, metricIndex: 0),
-                      child: infoCard(
-                        title: 'Current Generation (W)',
-                        child: SpeedometerPlaceholder(value: _generation, max: _panelMax, unit: 'W'),
-                      ),
-                    ),
+                    // Brightness widget at the top
+                    brightnessCard(),
+                    const SizedBox(height: 12),
+                    // The rest of the grid
+                    Expanded(
+                      child: GridView.count(
+                        crossAxisCount: 2,
+                        crossAxisSpacing: 12,
+                        mainAxisSpacing: 12,
+                        children: [
+                          // Current Generation (watts)
+                          GestureDetector(
+                            onTap: () => widget.onNavigateToPage?.call(1, metricIndex: 0),
+                            child: infoCard(
+                              title: 'Current Generation (W)',
+                              child: SpeedometerPlaceholder(value: _generation, max: _panelMax, unit: 'W'),
+                            ),
+                          ),
 
-                    // Battery Capacity (percent)
-                    GestureDetector(
-                      onTap: () => widget.onNavigateToPage?.call(1, metricIndex: 1),
-                      child: infoCard(
-                        title: 'Battery Capacity (Ah)',
-                        // Firebase provides battery as a percentage; convert to Ah
-                        child: SpeedometerPlaceholder(value: (_battery / 100.0) * _batteryMax, max: _batteryMax, unit: 'Ah'),
-                      ),
-                    ),
+                          // Battery Capacity (percent)
+                          GestureDetector(
+                            onTap: () => widget.onNavigateToPage?.call(1, metricIndex: 1),
+                            child: infoCard(
+                              title: 'Battery Capacity (Ah)',
+                              child: SpeedometerPlaceholder(value: (_battery / 100.0) * _batteryMax, max: _batteryMax, unit: 'Ah'),
+                            ),
+                          ),
 
-                    // Power Usage (watts)
-                    GestureDetector(
-                      onTap: () => widget.onNavigateToPage?.call(1, metricIndex: 2),
-                      child: infoCard(
-                        title: 'Power Usage (W)',
-                        child: SpeedometerPlaceholder(value: _usage, max: _panelMax, unit: 'W'),
-                      ),
-                    ),
+                          // Power Usage (watts)
+                          GestureDetector(
+                            onTap: () => widget.onNavigateToPage?.call(1, metricIndex: 2),
+                            child: infoCard(
+                              title: 'Power Usage (W)',
+                              child: SpeedometerPlaceholder(value: _usage, max: _panelMax, unit: 'W'),
+                            ),
+                          ),
 
-                    // Battery Temperature (°C)
-                    GestureDetector(
-                      onTap: () => widget.onNavigateToPage?.call(1, metricIndex: 3),
-                      child: infoCard(
-                        title: 'Battery Temperature (°C)',
-                        child: Center(
-                          child: SpeedometerPlaceholder(value: _batteryTemp, max: 100, unit: '°C'),
-                        ),
+                          // Conversion Efficiency (%)
+                          GestureDetector(
+                            onTap: () => widget.onNavigateToPage?.call(1, metricIndex: 3),
+                            child: infoCard(
+                              title: 'Conversion Efficiency (%)',
+                              child: Center(
+                                child: SpeedometerPlaceholder(value: _efficiency, max: 100, unit: '%'),
+                              ),
+                            ),
+                          ),
+                        ],
                       ),
                     ),
                   ],
@@ -915,7 +1083,6 @@ class _LandingPageState extends State<LandingPage> {
               ),
             ),
 
-            // small refresh button in the bottom-right of the landing area
             Positioned(
               bottom: 8,
               right: 8,
@@ -1238,19 +1405,47 @@ class LightControlsPage extends StatefulWidget {
 class LightingControl {
   String name;
   bool isOn;
+  int number; // 1-based index for lightN
 
-  LightingControl({required this.name, this.isOn = false});
+  LightingControl({required this.name, this.isOn = false, required this.number});
 }
 
 class _LightControlsPageState extends State<LightControlsPage> {
+    StreamSubscription<DatabaseEvent>? _lightsSub;
   final lightingControlsRef = userRef().child("lightingControls");
+  static const int maxSwitches = 4; //matches number of relays on microcontroller, change as needed.
 
-  // Example initial controls; you can replace or load these from Firebase.
   final List<LightingControl> controls = [
-    LightingControl(name: 'Porch', isOn: false),
-    LightingControl(name: 'Living Room', isOn: false),
-    LightingControl(name: 'Kitchen', isOn: false),
+    LightingControl(name: 'Porch', isOn: false, number: 1),
+    LightingControl(name: 'Living Room', isOn: false, number: 2),
+    LightingControl(name: 'Kitchen', isOn: false, number: 3),
+    LightingControl(name: 'Patio', isOn: false, number: 4)
   ];
+
+  @override
+  void initState() {
+    super.initState();
+    _lightsSub = lightingControlsRef.onValue.listen((event) {
+      final data = event.snapshot.value;
+      if (data is Map) {
+        setState(() {
+          for (var c in controls) {
+            final key = 'light${c.number}';
+            if (data.containsKey(key)) {
+              final v = data[key];
+              c.isOn = v == true || (v is String && v.toLowerCase() == 'true') || (v is num && v != 0);
+            }
+          }
+        });
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _lightsSub?.cancel();
+    super.dispose();
+  }
 
   bool _isEditing = false;
 
@@ -1259,12 +1454,11 @@ class _LightControlsPageState extends State<LightControlsPage> {
       controls[index].isOn = value;
     });
 
-    // Write the new state to Firebase under lightingControls/<controlName>
+    // Write the new state to Firebase under lightingControls/lightN
     try {
-      lightingControlsRef.child(controls[index].name).set(value);
+      final num = controls[index].number;
+      lightingControlsRef.child('light$num').set(value);
     } catch (e) {
-      // If Firebase isn't available, we still update local UI.
-      // Show failure-only SnackBar when toggle cannot be confirmed/saved.
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Failed to toggle — database unreachable')),
@@ -1275,15 +1469,33 @@ class _LightControlsPageState extends State<LightControlsPage> {
 
   void _addControl() {
     final messenger = ScaffoldMessenger.of(context);
+    if (controls.length >= maxSwitches) {
+      showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('All switches are in use'),
+          content: const Text('All switches are in use, remove an existing switch and try again!'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('OK'),
+            ),
+          ],
+        ),
+      );
+      return;
+    }
     setState(() {
-      final newName = 'Light ${controls.length + 1}';
-      controls.add(LightingControl(name: newName, isOn: false));
+      final newNumber = controls.length + 1;
+      final newName = 'Light $newNumber';
+      controls.add(LightingControl(name: newName, isOn: false, number: newNumber));
     });
     // Try to persist a default OFF state in Firebase
-    final newName = controls.last.name;
-    lightingControlsRef.child(newName).set(false).then((_) {
+    final idx = controls.length - 1;
+    final num = controls[idx].number;
+    lightingControlsRef.child('light$num').set(false).then((_) {
       messenger.showSnackBar(
-        SnackBar(content: Text('Added "$newName"')),
+        SnackBar(content: Text('Added "light$num"')),
       );
     }).catchError((_) {
       messenger.showSnackBar(
@@ -1319,13 +1531,13 @@ class _LightControlsPageState extends State<LightControlsPage> {
       // Update Firebase: set new child value and remove old child
       try {
         final value = controls[index].isOn;
-        await lightingControlsRef.child(result).set(value);
+        final num = controls[index].number;
+        await lightingControlsRef.child('light$num').set(value);
         await lightingControlsRef.child(oldName).remove();
         messenger.showSnackBar(
           SnackBar(content: Text('Renamed to "$result"')),
         );
       } catch (e) {
-        // handle errors as needed
         messenger.showSnackBar(
           const SnackBar(content: Text('Failed to rename control in database')),
         );
@@ -1336,6 +1548,7 @@ class _LightControlsPageState extends State<LightControlsPage> {
   Future<void> _removeControl(int index) async {
     final messenger = ScaffoldMessenger.of(context);
     final name = controls[index].name;
+    final num = controls[index].number;
     final confirm = await showDialog<bool?>(
       context: context,
       builder: (context) => AlertDialog(
@@ -1351,14 +1564,17 @@ class _LightControlsPageState extends State<LightControlsPage> {
     if (confirm == true) {
       setState(() {
         controls.removeAt(index);
+        // Re-number remaining controls
+        for (int i = 0; i < controls.length; i++) {
+          controls[i].number = i + 1;
+        }
       });
       try {
-        await lightingControlsRef.child(name).remove();
+        await lightingControlsRef.child('light$num').remove();
         messenger.showSnackBar(
           SnackBar(content: Text('Removed "$name"')),
         );
       } catch (e) {
-        // handle errors as needed
         messenger.showSnackBar(
           const SnackBar(content: Text('Failed to remove control')),
         );
@@ -1463,6 +1679,35 @@ class CameraRecordingsPage extends StatefulWidget {
 }
 
 class _CameraRecordingsPageState extends State<CameraRecordingsPage> {
+    bool _motionStatus = false;
+    bool _humanStatus = false;
+    bool _sensorLoading = true;
+
+    Future<void> _loadSensorStatus() async {
+      setState(() => _sensorLoading = true);
+      try {
+        final db = userRef();
+        final motionSnap = await db.child('sensorData').child('motion').get();
+        final humanSnap = await db.child('sensorData').child('humanActivity').child('detected').get();
+        bool motion = false;
+        bool human = false;
+        if (motionSnap.exists) {
+          final v = motionSnap.value;
+          motion = v == true || (v is String && v.toLowerCase() == 'true') || (v is num && v != 0);
+        }
+        if (humanSnap.exists) {
+          final v = humanSnap.value;
+          human = v == true || (v is String && v.toLowerCase() == 'true') || (v is num && v != 0);
+        }
+        setState(() {
+          _motionStatus = motion;
+          _humanStatus = human;
+          _sensorLoading = false;
+        });
+      } catch (_) {
+        setState(() => _sensorLoading = false);
+      }
+    }
   final FirebaseStorage _storage = FirebaseStorage.instance;
   List<Reference> _items = [];
   bool _loading = true;
@@ -1471,6 +1716,7 @@ class _CameraRecordingsPageState extends State<CameraRecordingsPage> {
   void initState() {
     super.initState();
     _loadList();
+    _loadSensorStatus();
   }
 
   Future<void> _loadList() async {
@@ -1481,6 +1727,7 @@ class _CameraRecordingsPageState extends State<CameraRecordingsPage> {
       final ref = _storage.ref().child('recordings').child(key);
       final listResult = await ref.listAll();
       setState(() => _items = List<Reference>.from(listResult.items));
+      await _loadSensorStatus();
     } catch (e) {
       if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Failed to list recordings')));
     } finally {
@@ -1578,25 +1825,43 @@ class _CameraRecordingsPageState extends State<CameraRecordingsPage> {
           IconButton(icon: const Icon(Icons.refresh), onPressed: _loadList, tooltip: 'Refresh'),
         ],
       ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : _items.isEmpty
-              ? Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
+      body: Column(
+        children: [
+          Expanded(
+            child: _loading
+                ? const Center(child: CircularProgressIndicator())
+                : _items.isEmpty
+                    ? Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Text('No recordings found'),
+                            const SizedBox(height: 8),
+                            ElevatedButton.icon(onPressed: _loadList, icon: const Icon(Icons.refresh), label: const Text('Refresh')),
+                          ],
+                        ),
+                      )
+                    : ListView.separated(
+                        padding: const EdgeInsets.all(12),
+                        itemCount: _items.length,
+                        separatorBuilder: (_, __) => const Divider(),
+                        itemBuilder: (context, index) => Card(child: _buildItemTile(_items[index])),
+                      ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 16),
+            child: _sensorLoading
+                ? const Text('Loading sensor status...')
+                : Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      const Text('No recordings found'),
-                      const SizedBox(height: 8),
-                      ElevatedButton.icon(onPressed: _loadList, icon: const Icon(Icons.refresh), label: const Text('Refresh')),
+                      Text('Motion Sensor: ${_motionStatus ? "Active" : "Inactive"}', style: TextStyle(fontSize: 16)),
+                      Text('Human Activity Sensor: ${_humanStatus ? "Active" : "Inactive"}', style: TextStyle(fontSize: 16)),
                     ],
                   ),
-                )
-              : ListView.separated(
-                  padding: const EdgeInsets.all(12),
-                  itemCount: _items.length,
-                  separatorBuilder: (_, __) => const Divider(),
-                  itemBuilder: (context, index) => Card(child: _buildItemTile(_items[index])),
-                ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -1655,8 +1920,19 @@ class SettingsPage extends StatefulWidget {
   final ThemeMode themeMode;
   final void Function(bool) onThemeChanged;
   final void Function(bool)? onNotifyPrefChanged;
+  final bool autoDarkMode;
+  final Future<void> Function(bool)? onAutoDarkModeChanged;
+  final bool autoDarkModeLoading;
 
-  const SettingsPage({super.key, required this.themeMode, required this.onThemeChanged, this.onNotifyPrefChanged});
+  const SettingsPage({
+    super.key,
+    required this.themeMode,
+    required this.onThemeChanged,
+    this.onNotifyPrefChanged,
+    required this.autoDarkMode,
+    this.onAutoDarkModeChanged,
+    this.autoDarkModeLoading = false,
+  });
 
   @override
   State<SettingsPage> createState() => _SettingsPageState();
@@ -1815,10 +2091,13 @@ class _SettingsPageState extends State<SettingsPage> {
           const Text('Night lighting mode', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600)),
             const SizedBox(height: 8),
             DropdownButton<int>(
-              value: _nightPref == 2 ? 2 : 1, // Only allow 1 or 2 in UI
+              value: _nightPref, // Allow all menu items to be selected
               items: const [
+                DropdownMenuItem(value: 0, child: Text('Off')),
+                DropdownMenuItem(value: 4, child: Text('After Sunset')),
                 DropdownMenuItem(value: 1, child: Text('Motion')),
                 DropdownMenuItem(value: 2, child: Text('Human Activity')),
+                DropdownMenuItem(value: 3, child: Text('Activity AND Motion')),
               ],
               onChanged: (v) async {
                 if (v == null) return;
@@ -1867,11 +2146,22 @@ class _SettingsPageState extends State<SettingsPage> {
             ),
           ),
           const SizedBox(height: 16),
+          CheckboxListTile(
+            title: const Text('Automatic dark mode'),
+            subtitle: const Text('Enable automatic theme switching based on ambient light'),
+            value: widget.autoDarkMode,
+            onChanged: (value) async {
+              if (value == null || widget.onAutoDarkModeChanged == null) return;
+              await widget.onAutoDarkModeChanged!(value);
+              setState(() {});
+            },
+            secondary: const Icon(Icons.lightbulb_outline),
+          ),
           SwitchListTile(
             title: const Text('Dark mode'),
             subtitle: const Text('Toggle between light and dark themes'),
             value: widget.themeMode == ThemeMode.dark,
-            onChanged: (value) async {
+            onChanged: (widget.autoDarkMode ? null : (value) async {
               // Update remote setting in Firebase
               try {
                 final settingsRef = userRef().child('settings');
@@ -1883,13 +2173,17 @@ class _SettingsPageState extends State<SettingsPage> {
                   );
                 }
               }
-
-              // Update local app theme
               widget.onThemeChanged(value);
               setState(() {});
-            },
+            }),
             secondary: const Icon(Icons.brightness_6),
+            activeColor: widget.autoDarkMode ? Colors.grey : null,
           ),
+          if (widget.autoDarkModeLoading)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: Text('Checking ambient light...', style: TextStyle(color: Colors.grey)),
+            ),
           const SizedBox(height: 32),
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
@@ -1927,9 +2221,20 @@ const Map<String, dynamic> _dataTemplate = {
     "Porch": false,
   },
   "powerData": {
-    "battery": 65,
-    "generation": 77,
-    "usage": 69,
+  "battery_pct": 39.6,
+  "dac_code": 4095,
+  "dac_v": 2.048,
+  "eff_pct": 90,
+  "iin_a": 1.888,
+  "iout_a": 1.488,
+  "kwh": 0.00014,
+  "pin_w": 20.545,
+  "pout_w": 18.49,
+  "soc_pct": 39.6,
+  "vcmd_v": 11,
+  "vin_v": 10.881,
+  "vout_v": 12.425,
+  "wh": 0.141
   },
   "readings": {
     "111120251000": {"current": 0.56, "power": 10.0, "temperature": 18.0, "voltage": 18.0, "timestamp_human": "2025-11-11T10:00:00Z"},
